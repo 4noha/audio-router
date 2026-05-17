@@ -21,12 +21,16 @@ enum CA {
         guard AudioObjectGetPropertyDataSize(object, &address, 0, nil, &dataSize) == noErr,
               dataSize > 0 else { return [] }
         let count = Int(dataSize) / MemoryLayout<T>.stride
-        var buffer = [T](repeating: unsafeBitCast((0 as UInt64), to: T.self), count: count)
-        let status = buffer.withUnsafeMutableBytes { raw -> OSStatus in
+        guard count > 0 else { return [] }
+        // ゼロ値 T を作らず生バイトで受けてから T へ変換（型サイズ非依存）。
+        var bytes = [UInt8](repeating: 0, count: Int(dataSize))
+        let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
             AudioObjectGetPropertyData(object, &address, 0, nil, &dataSize, raw.baseAddress!)
         }
         guard status == noErr else { return [] }
-        return buffer
+        return bytes.withUnsafeBytes { raw in
+            Array(raw.bindMemory(to: T.self).prefix(count))
+        }
     }
 
     /// スカラ値プロパティ（型 T）を取得。
