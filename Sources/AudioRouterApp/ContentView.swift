@@ -57,8 +57,8 @@ struct ContentView: View {
                     }
                     .disabled(ctl.isRunning || !ctl.monitorEnabled)
 
-                    Text("元アプリはミュートしません。既定出力でそのまま聴けるため、"
-                         + "モニタは別デバイスへ流したい時のみ ON（二重再生注意）。")
+                    Text("モニタ ON：元アプリ出力をミュートし選んだデバイスへ一本化"
+                         + "（二重再生なし）。OFF：元アプリの音はそのまま、UDP のみ送出。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

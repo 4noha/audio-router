@@ -48,12 +48,14 @@ public final class ProcessTapEngine: @unchecked Sendable {
                       monitorDevice: AudioObjectID?) throws {
         stop()
 
-        // 1) タップ記述（モノミックスダウン・private・元アプリはミュートしない）
+        // 1) タップ記述（モノミックスダウン・private）。
+        //    モニタ ON 時は元アプリ出力をミュートして二重再生を防ぐ
+        //    （モニタ側デバイスへ一本化）。OFF 時は元アプリの音を残す。
         let desc = CATapDescription(
             monoMixdownOfProcesses: [processObject])
         desc.name = "AudioRouter Tap"
         desc.isPrivate = true
-        desc.muteBehavior = .unmuted
+        desc.muteBehavior = (monitorDevice != nil) ? .mutedWhenTapped : .unmuted
 
         var tap = AudioObjectID(0)
         let ts = AudioHardwareCreateProcessTap(desc, &tap)
