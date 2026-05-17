@@ -34,6 +34,7 @@ public final class ProcessTapEngine: @unchecked Sendable {
     private let ioQueue = DispatchQueue(label: "audio-router.ioproc", qos: .userInteractive)
 
     private var sender: PCMSender?
+    private var shm: ShmSender?
     private var monitor: AudioMonitor?
     private var sourceChannels = 2
     private var sampleRate: Double = 48_000
@@ -98,6 +99,7 @@ public final class ProcessTapEngine: @unchecked Sendable {
         // 4) 出力先（UDP / モニタ）
         sender = PCMSender(host: sendHost, port: sendPort,
                            channels: 1, sampleRate: UInt32(sampleRate))
+        shm = ShmSender(srcSampleRate: sampleRate) // 4ksplitter は共有メモリ受信
         if let monitorDevice {
             monitor = AudioMonitor(deviceID: monitorDevice, sampleRate: sampleRate)
             try? monitor?.start()
@@ -162,6 +164,7 @@ public final class ProcessTapEngine: @unchecked Sendable {
         if chans == 1 {
             let buf = UnsafeBufferPointer(start: src, count: frames)
             sender?.send(buf)
+            shm?.send(buf)
             monitor?.enqueue(buf)
         } else {
             var mono = [Float](repeating: 0, count: frames)
@@ -172,6 +175,7 @@ public final class ProcessTapEngine: @unchecked Sendable {
             }
             mono.withUnsafeBufferPointer { buf in
                 sender?.send(buf)
+                shm?.send(buf)
                 monitor?.enqueue(buf)
             }
         }

@@ -1,30 +1,61 @@
 import Foundation
 
-/// 1 本の音声ルート定義（FROM アプリ → UDP / 任意モニタ）。
-/// Karabiner の complex-modification ルールと同様、トグルで個別に
-/// 有効化でき、JSON で永続化される。
+/// ルートの種別。
+/// - appRoute  : アプリ音声を捕捉 → 4ksplitter(共有メモリ) / 任意 UDP・モニタ
+/// - babigoeHub: マイク → babigoe(声質変換) → 回収 → 4ksplitter(＋任意モニタ/UDP)
+enum RuleKind: String, Codable, Hashable {
+    case appRoute, babigoeHub
+}
+
+/// 1 本のルーティング定義（IN → OUT）。Karabiner 風に一覧へ並べ、
+/// 行トグルで個別に有効化。JSON で永続化される。
 struct RoutingRule: Identifiable, Codable, Hashable {
     var id = UUID()
+    var kind: RuleKind = .appRoute
 
-    /// 対象アプリ。bundleID は再起動をまたいで安定するためマッチングに使う。
-    var sourceBundleID: String
-    /// 表示用キャッシュ名（対象アプリ未起動でも一覧に出すため）。
-    var sourceName: String
+    // appRoute: 対象アプリ（bundleID は再起動をまたいで安定）
+    var sourceBundleID: String = ""
+    var sourceName: String = ""
 
+    // 送出（appRoute は任意 UDP、babigoeHub は任意 UDP 追加経路）
     var sendHost: String = "127.0.0.1"
     var sendPort: String = "7878"
+    var udpEnabled: Bool = false
 
+    // モニタ（自分の声/音を別デバイスで聴く）
     var monitorEnabled: Bool = false
-    /// モニタ出力デバイス UID（空 = 既定出力）。UID は安定識別子。
-    var monitorDeviceUID: String = ""
+    var monitorDeviceUID: String = ""   // 空 = 既定出力
 
-    /// ユーザが意図する有効状態（永続化）。実エンジン状態と一致させる。
+    // babigoeHub: 入力マイク
+    var micUID: String = ""             // 空 = 既定入力
+    var micName: String = ""
+
+    /// ユーザ意図の有効状態（永続化）。実エンジン状態と一致させる。
     var enabled: Bool = false
 
-    /// 行サブテキスト（"VLC → UDP 127.0.0.1:7878 ＋モニタ"）。
-    var displaySummary: String {
-        var s = "UDP \(sendHost):\(sendPort)"
+    // MARK: - 一覧表示（IN → OUT）
+
+    var inIcon: String {
+        kind == .babigoeHub ? "mic.fill" : "app.fill"
+    }
+
+    var displayIn: String {
+        switch kind {
+        case .appRoute:
+            return sourceName.isEmpty ? "（アプリ未選択）" : sourceName
+        case .babigoeHub:
+            return micName.isEmpty ? "既定マイク" : micName
+        }
+    }
+
+    var displayOut: String {
+        var s: String
+        switch kind {
+        case .appRoute:   s = "4ksplitter"
+        case .babigoeHub: s = "babigoe → 4ksplitter"
+        }
         if monitorEnabled { s += " ＋モニタ" }
+        if udpEnabled { s += " ＋UDP \(sendHost):\(sendPort)" }
         return s
     }
 }

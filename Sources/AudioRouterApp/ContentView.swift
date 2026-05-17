@@ -11,7 +11,7 @@ enum Pane: String, CaseIterable, Identifiable {
 
     var sidebarLabel: String {
         switch self {
-        case .rules:       return "Rules"
+        case .rules:       return "Routing"
         case .activity:    return "Activity"
         case .maintenance: return "Maintenance"
         }
@@ -96,21 +96,34 @@ private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some 
 @available(macOS 14.4, *)
 struct RulesView: View {
     @ObservedObject var ctl: RouterController
-    @State private var editing: RoutingRule?
+    @State private var editing: RoutingRule = RoutingRule()
+    @State private var isNew = false
     @State private var showEditor = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            PaneHeader(title: "Audio Router — Routing Rules",
-                       subtitle: "アプリごとの音声ルートをトグルで個別に有効化")
+            PaneHeader(title: "Audio Router — Routing",
+                       subtitle: "IN → OUT をトグルで個別に有効化（チャンネル管理）")
 
             HStack(spacing: 10) {
                 Button {
-                    editing = nil; ctl.refreshLists(); showEditor = true
+                    var r = RoutingRule(); r.kind = .appRoute
+                    editing = r; isNew = true
+                    ctl.refreshLists(); showEditor = true
                 } label: {
-                    Label("ルールを追加", systemImage: "plus.circle.fill")
+                    Label("アプリ → 4ksplitter", systemImage: "plus.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
+
+                Button {
+                    var r = RoutingRule(); r.kind = .babigoeHub
+                    editing = r; isNew = true
+                    ctl.refreshLists(); showEditor = true
+                } label: {
+                    Label("マイク → babigoe", systemImage: "mic.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
 
                 Button {
                     ctl.refreshLists()
@@ -125,11 +138,11 @@ struct RulesView: View {
 
             if ctl.rules.isEmpty {
                 VStack(spacing: 8) {
-                    Image(systemName: "slider.horizontal.3")
+                    Image(systemName: "arrow.left.arrow.right")
                         .font(.largeTitle).foregroundStyle(.tertiary)
-                    Text("ルールがありません")
+                    Text("ルートがありません")
                         .foregroundStyle(.secondary)
-                    Text("「ルールを追加」から FROM アプリと送出先を設定します。")
+                    Text("上のボタンで IN→OUT のルートを追加します。")
                         .font(.caption).foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -146,20 +159,27 @@ struct RulesView: View {
             }
         }
         .sheet(isPresented: $showEditor) {
-            RuleEditorView(ctl: ctl, original: editing) { saved in
-                if editing == nil { ctl.addRule(saved) }
-                else { ctl.updateRule(saved) }
+            RuleEditorView(ctl: ctl, original: editing, isNew: isNew) { saved in
+                if isNew { ctl.addRule(saved) } else { ctl.updateRule(saved) }
             }
         }
     }
 
+    // IN  →  OUT   [status]  [toggle][編集][🗑]
     private func ruleRow(_ rule: RoutingRule) -> some View {
         card {
             HStack(spacing: 14) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(rule.sourceName).font(.body).bold()
-                    Text(rule.displaySummary)
-                        .font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Label(rule.displayIn, systemImage: rule.inIcon)
+                            .font(.body).bold()
+                            .labelStyle(.titleAndIcon)
+                        Image(systemName: "arrow.right")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text(rule.displayOut)
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                    }
                     if let st = ctl.statusByRule[rule.id], !st.isEmpty {
                         Text(st)
                             .font(.caption2)
@@ -176,7 +196,8 @@ struct RulesView: View {
                     .tint(.blue)
 
                 Button {
-                    editing = rule; ctl.refreshLists(); showEditor = true
+                    editing = rule; isNew = false
+                    ctl.refreshLists(); showEditor = true
                 } label: {
                     Label("編集", systemImage: "pencil")
                 }
@@ -195,62 +216,93 @@ struct RulesView: View {
     }
 }
 
-// MARK: - ルール編集シート
+// MARK: - ルール編集シート（kind で IN を分岐）
 
 @available(macOS 14.4, *)
 struct RuleEditorView: View {
     @ObservedObject var ctl: RouterController
-    let original: RoutingRule?
+    let original: RoutingRule
+    let isNew: Bool
     let onSave: (RoutingRule) -> Void
     @Environment(\.dismiss) private var dismiss
 
     @State private var bundleID = ""
     @State private var sourceName = ""
+    @State private var micUID = ""
+    @State private var micName = ""
     @State private var host = "127.0.0.1"
     @State private var port = "7878"
+    @State private var udpEnabled = false
     @State private var monitorEnabled = false
     @State private var monitorUID = ""
 
+    private var kind: RuleKind { original.kind }
+
+    private var canSave: Bool {
+        kind == .appRoute ? !bundleID.isEmpty : true   // hub は既定マイク可
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(original == nil ? "ルールを追加" : "ルールを編集")
+            Text((isNew ? "ルートを追加" : "ルートを編集")
+                 + (kind == .babigoeHub ? "（マイク → babigoe）" : "（アプリ → 4ksplitter）"))
                 .font(.title3).bold()
 
-            GroupBox("FROM — 対象アプリ（音声出力中のプロセス）") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Picker("アプリ", selection: $bundleID) {
-                        Text("選択してください").tag("")
-                        if !bundleID.isEmpty,
-                           !ctl.processes.contains(where: { $0.bundleID == bundleID }) {
-                            Text("\(sourceName)（未起動）").tag(bundleID)
+            if kind == .appRoute {
+                GroupBox("IN — 対象アプリ（音声出力中のプロセス）") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("アプリ", selection: $bundleID) {
+                            Text("選択してください").tag("")
+                            if !bundleID.isEmpty,
+                               !ctl.processes.contains(where: { $0.bundleID == bundleID }) {
+                                Text("\(sourceName)（未起動）").tag(bundleID)
+                            }
+                            ForEach(ctl.processes.filter { !$0.bundleID.isEmpty }) { p in
+                                Text(p.name).tag(p.bundleID)
+                            }
                         }
-                        ForEach(ctl.processes.filter { !$0.bundleID.isEmpty }) { p in
-                            Text(p.name).tag(p.bundleID)
+                        .onChange(of: bundleID) { _, new in
+                            if let p = ctl.processes.first(where: { $0.bundleID == new }) {
+                                sourceName = p.name
+                            }
+                        }
+                        Button { ctl.refreshLists() } label: {
+                            Label("一覧を更新", systemImage: "arrow.clockwise")
                         }
                     }
-                    .onChange(of: bundleID) { _, new in
-                        if let p = ctl.processes.first(where: { $0.bundleID == new }) {
-                            sourceName = p.name
-                        }
-                    }
-                    Button {
-                        ctl.refreshLists()
-                    } label: {
-                        Label("一覧を更新", systemImage: "arrow.clockwise")
-                    }
+                    .padding(6)
                 }
-                .padding(6)
+            } else {
+                GroupBox("IN — マイク（audio-router が babigoe へ供給）") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("マイク", selection: $micUID) {
+                            Text("既定の入力").tag("")
+                            if !micUID.isEmpty,
+                               !ctl.inputs.contains(where: { $0.uid == micUID }) {
+                                Text("\(micName)（未接続）").tag(micUID)
+                            }
+                            ForEach(ctl.inputs) { d in
+                                Text(d.name).tag(d.uid)
+                            }
+                        }
+                        .onChange(of: micUID) { _, new in
+                            if let d = ctl.inputs.first(where: { $0.uid == new }) {
+                                micName = d.name
+                            }
+                        }
+                        Button { ctl.refreshLists() } label: {
+                            Label("一覧を更新", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .padding(6)
+                }
             }
 
-            GroupBox("TO — 送出先") {
+            GroupBox("OUT — " + (kind == .babigoeHub
+                                 ? "babigoe(声質変換) → 4ksplitter"
+                                 : "4ksplitter（共有メモリ）")) {
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("4ksplitter (UDP)")
-                        TextField("host", text: $host).frame(width: 130)
-                        Text(":")
-                        TextField("port", text: $port).frame(width: 70)
-                    }
-                    Toggle("モニタ出力（別デバイスへ流して聴く）", isOn: $monitorEnabled)
+                    Toggle("モニタ出力（別デバイスで聴く）", isOn: $monitorEnabled)
                     Picker("出力デバイス", selection: $monitorUID) {
                         Text("既定の出力").tag("")
                         ForEach(ctl.outputs) { d in
@@ -258,6 +310,15 @@ struct RuleEditorView: View {
                         }
                     }
                     .disabled(!monitorEnabled)
+                    Divider()
+                    Toggle("追加 UDP 送出（4ksplitter 以外の経路）", isOn: $udpEnabled)
+                    HStack {
+                        Text("UDP")
+                        TextField("host", text: $host).frame(width: 130)
+                        Text(":")
+                        TextField("port", text: $port).frame(width: 70)
+                    }
+                    .disabled(!udpEnabled)
                 }
                 .padding(6)
             }
@@ -266,12 +327,15 @@ struct RuleEditorView: View {
                 Spacer()
                 Button("キャンセル") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button(original == nil ? "追加" : "保存") {
-                    var r = original ?? RoutingRule(sourceBundleID: "", sourceName: "")
+                Button(isNew ? "追加" : "保存") {
+                    var r = original
                     r.sourceBundleID = bundleID
                     r.sourceName = sourceName.isEmpty ? bundleID : sourceName
+                    r.micUID = micUID
+                    r.micName = micName
                     r.sendHost = host
                     r.sendPort = port
+                    r.udpEnabled = udpEnabled
                     r.monitorEnabled = monitorEnabled
                     r.monitorDeviceUID = monitorUID
                     onSave(r)
@@ -279,21 +343,22 @@ struct RuleEditorView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(bundleID.isEmpty)
+                .disabled(!canSave)
             }
         }
         .padding(22)
-        .frame(width: 470)
+        .frame(width: 480)
         .onAppear {
             ctl.refreshLists()
-            if let o = original {
-                bundleID = o.sourceBundleID
-                sourceName = o.sourceName
-                host = o.sendHost
-                port = o.sendPort
-                monitorEnabled = o.monitorEnabled
-                monitorUID = o.monitorDeviceUID
-            }
+            bundleID = original.sourceBundleID
+            sourceName = original.sourceName
+            micUID = original.micUID
+            micName = original.micName
+            host = original.sendHost
+            port = original.sendPort
+            udpEnabled = original.udpEnabled
+            monitorEnabled = original.monitorEnabled
+            monitorUID = original.monitorDeviceUID
         }
     }
 }
@@ -316,7 +381,7 @@ struct ActivityView: View {
                                     .fill(ctl.active(rule.id) ? Color.green : Color.gray)
                                     .frame(width: 9, height: 9)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(rule.sourceName).bold()
+                                    Text("\(rule.displayIn) → \(rule.displayOut)").bold()
                                     Text(ctl.statusByRule[rule.id]
                                          ?? (ctl.active(rule.id) ? "稼働中" : "停止中"))
                                         .font(.caption).foregroundStyle(.secondary)
