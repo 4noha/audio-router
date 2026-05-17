@@ -3,74 +3,157 @@ import SwiftUI
 import CoreAudio
 import AudioRouterCore
 
-/// UI ↔ エンジンの仲介。FROM(プロセス)/TO(モニタ出力) 選択と ON/OFF を保持。
+/// ルール一覧の保持・永続化と、ルール 1 本ごとの ProcessTapEngine 起動/停止。
+/// トグル状態 = 実エンジン状態に常に一致させる（起動失敗時は OFF へ矯正）。
 @available(macOS 14.4, *)
 @MainActor
 final class RouterController: ObservableObject {
+    @Published var rules: [RoutingRule] = []
     @Published var processes: [AudioProcess] = []
     @Published var outputs: [OutputDevice] = []
+    /// rule.id → 直近の状態テキスト（送出中 / 失敗理由）。
+    @Published var statusByRule: [UUID: String] = [:]
 
-    @Published var selectedProcessID: AudioProcess.ID?
-    @Published var monitorEnabled = false
-    @Published var selectedOutputID: OutputDevice.ID?
-
-    @Published var sendHost = "127.0.0.1"
-    @Published var sendPort = "7878"
-
-    @Published private(set) var isRunning = false
-    @Published var statusText = "停止中"
-
-    private let engine = ProcessTapEngine()
+    private var engines: [UUID: ProcessTapEngine] = [:]
+    private let storeURL: URL
 
     init() {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AudioRouter", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: base, withIntermediateDirectories: true)
+        storeURL = base.appendingPathComponent("rules.json")
+
         refreshLists()
-        selectedOutputID = AudioDeviceEnumerator.defaultOutput()?.id
+        load()
+        // 前回 ON だったルートを起動（失敗時はトグル OFF へ矯正）。
+        for rule in rules where rule.enabled {
+            if !activate(ruleID: rule.id),
+               let idx = rules.firstIndex(where: { $0.id == rule.id }) {
+                rules[idx].enabled = false
+            }
+        }
+        save()
     }
+
+    // MARK: - 一覧
 
     func refreshLists() {
         processes = ProcessEnumerator.list(onlyOutput: true)
         outputs = AudioDeviceEnumerator.outputs()
-        if let sel = selectedProcessID,
-           !processes.contains(where: { $0.id == sel }) {
-            selectedProcessID = nil
-        }
     }
 
-    func toggle() {
-        isRunning ? stop() : start()
+    func active(_ id: UUID) -> Bool { engines[id] != nil }
+
+    // MARK: - CRUD
+
+    func addRule(_ rule: RoutingRule) {
+        var r = rule
+        r.enabled = false
+        rules.append(r)
+        save()
     }
 
-    private func start() {
-        guard let procID = selectedProcessID,
-              let proc = processes.first(where: { $0.id == procID }) else {
-            statusText = "FROM（対象アプリ）を選択してください"
-            return
+    func updateRule(_ rule: RoutingRule) {
+        guard let idx = rules.firstIndex(where: { $0.id == rule.id }) else { return }
+        let wasActive = engines[rule.id] != nil
+        deactivate(ruleID: rule.id)
+        rules[idx] = rule
+        rules[idx].enabled = false
+        if wasActive { setEnabled(rule.id, true) }
+        save()
+    }
+
+    func deleteRule(_ id: UUID) {
+        deactivate(ruleID: id)
+        rules.removeAll { $0.id == id }
+        statusByRule[id] = nil
+        save()
+    }
+
+    // MARK: - トグル
+
+    func setEnabled(_ id: UUID, _ on: Bool) {
+        guard let idx = rules.firstIndex(where: { $0.id == id }) else { return }
+        if on {
+            rules[idx].enabled = activate(ruleID: id)
+        } else {
+            deactivate(ruleID: id)
+            rules[idx].enabled = false
+            statusByRule[id] = "停止中"
         }
-        guard let port = UInt16(sendPort) else {
-            statusText = "ポート番号が不正です"
-            return
+        save()
+    }
+
+    func stopAll() {
+        for (_, e) in engines { e.stop() }
+        engines.removeAll()
+    }
+
+    // MARK: - エンジン
+
+    @discardableResult
+    private func activate(ruleID: UUID) -> Bool {
+        guard let rule = rules.first(where: { $0.id == ruleID }) else { return false }
+        if engines[ruleID] != nil { return true }
+        refreshLists()
+
+        guard !rule.sourceBundleID.isEmpty,
+              let proc = processes.first(where: { $0.bundleID == rule.sourceBundleID })
+        else {
+            statusByRule[ruleID] = "対象アプリ「\(rule.sourceName)」が音声出力していません"
+            return false
+        }
+        guard let port = UInt16(rule.sendPort) else {
+            statusByRule[ruleID] = "ポート番号が不正です"
+            return false
         }
         guard let processObject = ProcessEnumerator.processObject(for: proc.pid) else {
-            statusText = "プロセス変換に失敗（既に終了？）"
-            return
+            statusByRule[ruleID] = "プロセス変換に失敗（既に終了？）"
+            return false
         }
-        let monitorDev: AudioObjectID? = monitorEnabled ? selectedOutputID : nil
+
+        var monitorDev: AudioObjectID?
+        if rule.monitorEnabled {
+            monitorDev = rule.monitorDeviceUID.isEmpty
+                ? AudioDeviceEnumerator.defaultOutput()?.id
+                : outputs.first(where: { $0.uid == rule.monitorDeviceUID })?.id
+        }
+
+        let engine = ProcessTapEngine()
         do {
             try engine.start(processObject: processObject,
-                             sendHost: sendHost, sendPort: port,
+                             sendHost: rule.sendHost, sendPort: port,
                              monitorDevice: monitorDev)
-            isRunning = true
-            statusText = "送出中: \(proc.name) → udp \(sendHost):\(port)"
-                + (monitorEnabled ? " ＋モニタ" : "")
+            engines[ruleID] = engine
+            statusByRule[ruleID] = "送出中: \(proc.name) → udp \(rule.sendHost):\(port)"
+                + (rule.monitorEnabled ? " ＋モニタ" : "")
+            return true
         } catch {
-            isRunning = false
-            statusText = "開始失敗: \(error)"
+            statusByRule[ruleID] = "開始失敗: \(error)"
+            return false
         }
     }
 
-    private func stop() {
-        engine.stop()
-        isRunning = false
-        statusText = "停止中"
+    private func deactivate(ruleID: UUID) {
+        if let engine = engines[ruleID] {
+            engine.stop()
+            engines[ruleID] = nil
+        }
+    }
+
+    // MARK: - 永続化
+
+    private func load() {
+        guard let data = try? Data(contentsOf: storeURL),
+              let decoded = try? JSONDecoder().decode([RoutingRule].self, from: data)
+        else { return }
+        rules = decoded
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(rules) else { return }
+        try? data.write(to: storeURL, options: .atomic)
     }
 }

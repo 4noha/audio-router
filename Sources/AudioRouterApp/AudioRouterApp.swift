@@ -5,9 +5,8 @@ struct AudioRouterApp: App {
     var body: some Scene {
         WindowGroup("Audio Router") {
             RootView()
-                .frame(minWidth: 460, minHeight: 420)
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
     }
 }
 
