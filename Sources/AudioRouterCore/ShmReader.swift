@@ -1,12 +1,13 @@
 import Darwin
 import Dispatch
+import CShmCompat
 
 /// ARPS v1 共有メモリの「所有者(consumer)」側（Swift）。指定 shm を作成・
 /// 初期化・破棄し、attach してきた writer(babigoe)が書く mono Float32(48k)
 /// を読み出す。契約は C# Arp1ShmWriter / VoiceShmReceiver と byte 一致。
 /// audio-router が /babigoe.out を所有して babigoe 出力を回収するのに使う。
 public final class ShmReader: @unchecked Sendable {
-    public static let nameBabigoeOut = "/babigoe.out"
+    public static let nameBabigoeOut = "/babigoe.out3"
 
     private let name: String
     private static let magic: Int32 = 0x5350_5241   // "ARPS" LE
@@ -20,15 +21,6 @@ public final class ShmReader: @unchecked Sendable {
                        offChannels = 12, offCapacity = 16, offReady = 20,
                        offWrite = 32, offRead = 40
 
-    // shm_open は C 可変長。O_CREAT を使うため mode 付き 3 引数固定の
-    // C 関数ポインタとして dlsym で解決して呼ぶ。
-    private typealias ShmOpenFn =
-        @convention(c) (UnsafePointer<CChar>, Int32, UInt16) -> Int32
-    private static let shmOpen: ShmOpenFn? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "shm_open")
-        else { return nil }
-        return unsafeBitCast(sym, to: ShmOpenFn.self)
-    }()
     private nonisolated(unsafe) static let mapFailed =
         UnsafeMutableRawPointer(bitPattern: -1)
 
@@ -46,10 +38,15 @@ public final class ShmReader: @unchecked Sendable {
     @discardableResult
     public func start() -> Bool {
         if running { return true }
-        guard let shmOpen = Self.shmOpen else { return false }
-        let f = name.withCString { shmOpen($0, O_RDWR | O_CREAT, 0o600) }
-        if f < 0 { return false }
-        if ftruncate(f, off_t(Self.totalBytes)) != 0 { close(f); return false }
+        // macOS の shm perm は shm_open(O_CREAT) の mode でしか決まらない
+        // (fchmod は EINVAL で不可)。mode は C 可変長引数なので Swift の
+        // dlsym 固定引数だと arm64 ABI でゴミ化する。C シムで正規 varargs。
+        var f = name.withCString { cshm_open_rw($0) }   // 既存を開く
+        if f < 0 {
+            f = name.withCString { cshm_open_create($0) } // O_CREAT mode0666
+            if f < 0 { return false }
+            _ = ftruncate(f, off_t(Self.totalBytes))      // 新規のみ
+        }
         let p = mmap(nil, Self.totalBytes,
                      PROT_READ | PROT_WRITE, MAP_SHARED, f, 0)
         if p == nil || p == Self.mapFailed { close(f); return false }
@@ -77,7 +74,9 @@ public final class ShmReader: @unchecked Sendable {
             base = nil
         }
         if fd >= 0 { close(fd); fd = -1 }
-        name.withCString { _ = shm_unlink($0) }
+        // shm_unlink しない: unlink すると attach 済みの書き手(babigoe)が
+        // orphan を掴み続け音が来なくなる。名前付き shm を安定した待ち合わせ点
+        // として再利用し、再起動時は start でヘッダ再初期化のみ行う。
     }
 
     deinit { stop() }

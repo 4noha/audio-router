@@ -3,21 +3,19 @@ import SwiftUI
 import CoreAudio
 import AudioRouterCore
 
-/// ルート一覧の保持・永続化と、ルール 1 本ごとのエンジン起動/停止。
-/// kind により appRoute=ProcessTapEngine / babigoeHub=HubEngine を使い分ける。
-/// トグル状態 = 実エンジン状態に常に一致させる（起動失敗時は OFF へ矯正）。
+/// 名前付き内部バスのパッチベイ。エッジ(IN: source→bus / OUT: bus→sink)を
+/// 個別トグルで起動停止し、毎秒 per-edge 診断を出す。edges.json で永続化。
 @available(macOS 14.4, *)
 @MainActor
 final class RouterController: ObservableObject {
-    @Published var rules: [RoutingRule] = []
+    @Published var edges: [RouteEdge] = []
     @Published var processes: [AudioProcess] = []
-    @Published var outputs: [OutputDevice] = []
     @Published var inputs: [InputDevice] = []
-    /// rule.id → 直近の状態テキスト（送出中 / 失敗理由）。
-    @Published var statusByRule: [UUID: String] = [:]
+    @Published var statusByEdge: [UUID: String] = [:]
 
-    private var engines: [UUID: ProcessTapEngine] = [:]   // appRoute
-    private var hubEngines: [UUID: HubEngine] = [:]        // babigoeHub
+    private var engines: [UUID: EdgeEngine] = [:]
+    private var buses: [String: AudioBus] = [:]
+    private var statusTimer: Timer?
     private let storeURL: URL
 
     init() {
@@ -26,183 +24,160 @@ final class RouterController: ObservableObject {
             .appendingPathComponent("AudioRouter", isDirectory: true)
         try? FileManager.default.createDirectory(
             at: base, withIntermediateDirectories: true)
-        storeURL = base.appendingPathComponent("rules.json")
+        storeURL = base.appendingPathComponent("edges.json")
 
         refreshLists()
         load()
-        // 前回 ON だったルートを復元（失敗時はトグル OFF へ矯正）。
-        for rule in rules where rule.enabled {
-            if !activate(ruleID: rule.id),
-               let idx = rules.firstIndex(where: { $0.id == rule.id }) {
-                rules[idx].enabled = false
+        for e in edges where e.enabled {
+            if !activate(e.id),
+               let i = edges.firstIndex(where: { $0.id == e.id }) {
+                edges[i].enabled = false
             }
         }
         save()
     }
 
-    // MARK: - 一覧
-
     func refreshLists() {
         processes = ProcessEnumerator.list(onlyOutput: true)
-        outputs = AudioDeviceEnumerator.outputs()
         inputs = AudioDeviceEnumerator.inputs()
     }
 
-    func active(_ id: UUID) -> Bool {
-        engines[id] != nil || hubEngines[id] != nil
+    func active(_ id: UUID) -> Bool { engines[id] != nil }
+
+    var busNames: [String] {
+        Array(Set(edges.map { $0.busName })).sorted()
     }
 
-    // MARK: - CRUD
+    // MARK: CRUD
 
-    func addRule(_ rule: RoutingRule) {
-        var r = rule
-        r.enabled = false
-        rules.append(r)
+    func addEdge(_ e: RouteEdge) {
+        var x = e; x.enabled = false
+        edges.append(x); save()
+    }
+    func updateEdge(_ e: RouteEdge) {
+        guard let i = edges.firstIndex(where: { $0.id == e.id }) else { return }
+        let wasActive = active(e.id)
+        deactivate(e.id)
+        edges[i] = e; edges[i].enabled = false
+        if wasActive { setEnabled(e.id, true) }
         save()
     }
-
-    func updateRule(_ rule: RoutingRule) {
-        guard let idx = rules.firstIndex(where: { $0.id == rule.id }) else { return }
-        let wasActive = active(rule.id)
-        deactivate(ruleID: rule.id)
-        rules[idx] = rule
-        rules[idx].enabled = false
-        if wasActive { setEnabled(rule.id, true) }
-        save()
+    func deleteEdge(_ id: UUID) {
+        deactivate(id); edges.removeAll { $0.id == id }
+        statusByEdge[id] = nil; save()
     }
-
-    func deleteRule(_ id: UUID) {
-        deactivate(ruleID: id)
-        rules.removeAll { $0.id == id }
-        statusByRule[id] = nil
-        save()
-    }
-
-    // MARK: - トグル
 
     func setEnabled(_ id: UUID, _ on: Bool) {
-        guard let idx = rules.firstIndex(where: { $0.id == id }) else { return }
+        guard let i = edges.firstIndex(where: { $0.id == id }) else { return }
         if on {
-            rules[idx].enabled = activate(ruleID: id)
+            edges[i].enabled = activate(id)
         } else {
-            deactivate(ruleID: id)
-            rules[idx].enabled = false
-            statusByRule[id] = "停止中"
+            deactivate(id); edges[i].enabled = false
+            statusByEdge[id] = "停止中"
         }
         save()
     }
 
     func stopAll() {
         for (_, e) in engines { e.stop() }
-        for (_, h) in hubEngines { h.stop() }
         engines.removeAll()
-        hubEngines.removeAll()
+        maybeStopTimer()
     }
 
-    // MARK: - エンジン起動
+    private func bus(_ name: String) -> AudioBus {
+        if let b = buses[name] { return b }
+        let b = AudioBus()
+        buses[name] = b
+        return b
+    }
+
+    // MARK: activate
 
     @discardableResult
-    private func activate(ruleID: UUID) -> Bool {
-        guard let rule = rules.first(where: { $0.id == ruleID }) else { return false }
-        if active(ruleID) { return true }
+    private func activate(_ id: UUID) -> Bool {
+        guard let e = edges.first(where: { $0.id == id }) else { return false }
+        if active(id) { return true }
         refreshLists()
-        switch rule.kind {
-        case .appRoute:   return activateApp(rule)
-        case .babigoeHub: return activateHub(rule)
-        }
-    }
-
-    private func activateApp(_ rule: RoutingRule) -> Bool {
-        guard !rule.sourceBundleID.isEmpty,
-              let proc = processes.first(where: { $0.bundleID == rule.sourceBundleID })
-        else {
-            statusByRule[rule.id] = "対象アプリ「\(rule.sourceName)」が音声出力していません"
-            return false
-        }
-        guard let port = UInt16(rule.sendPort) else {
-            statusByRule[rule.id] = "ポート番号が不正です"
-            return false
-        }
-        guard let processObject = ProcessEnumerator.processObject(for: proc.pid) else {
-            statusByRule[rule.id] = "プロセス変換に失敗（既に終了？）"
-            return false
-        }
-        var monitorDev: AudioObjectID?
-        if rule.monitorEnabled {
-            monitorDev = rule.monitorDeviceUID.isEmpty
-                ? AudioDeviceEnumerator.defaultOutput()?.id
-                : outputs.first(where: { $0.uid == rule.monitorDeviceUID })?.id
-        }
-        let engine = ProcessTapEngine()
+        let b = bus(e.busName)
         do {
-            try engine.start(processObject: processObject,
-                             sendHost: rule.sendHost, sendPort: port,
-                             monitorDevice: monitorDev)
-            engines[rule.id] = engine
-            statusByRule[rule.id] = "送出中: \(proc.name) → 4ksplitter"
-                + (rule.monitorEnabled ? " ＋モニタ" : "")
-                + (rule.udpEnabled ? " ＋UDP \(rule.sendHost):\(port)" : "")
-            return true
-        } catch {
-            statusByRule[rule.id] = "開始失敗: \(error)"
-            return false
-        }
-    }
+            switch (e.role, e.endpoint) {
+            case (.input, .appTap):
+                guard !e.appBundleID.isEmpty,
+                      let p = processes.first(where: { $0.bundleID == e.appBundleID })
+                else { statusByEdge[id] = "アプリ「\(e.appName)」が音声出力していません"; return false }
+                guard let po = ProcessEnumerator.processObject(for: p.pid)
+                else { statusByEdge[id] = "プロセス変換に失敗"; return false }
+                engines[id] = try TapInEdge(processObject: po,
+                                            muteSource: e.muteSource, bus: b)
 
-    private func activateHub(_ rule: RoutingRule) -> Bool {
-        let micID = rule.micUID.isEmpty
-            ? AudioDeviceEnumerator.defaultInput()?.id
-            : inputs.first(where: { $0.uid == rule.micUID })?.id
-        guard let micID else {
-            statusByRule[rule.id] = "マイク「\(rule.micName)」が見つかりません"
-            return false
-        }
-        var monID: AudioObjectID?
-        if rule.monitorEnabled {
-            monID = rule.monitorDeviceUID.isEmpty
-                ? AudioDeviceEnumerator.defaultOutput()?.id
-                : outputs.first(where: { $0.uid == rule.monitorDeviceUID })?.id
-        }
-        var host: String?
-        var port: UInt16?
-        if rule.udpEnabled {
-            guard let p = UInt16(rule.sendPort) else {
-                statusByRule[rule.id] = "UDP ポート番号が不正です"
-                return false
+            case (.input, .mic):
+                let dev = e.micUID.isEmpty
+                    ? AudioDeviceEnumerator.defaultInput()?.id
+                    : inputs.first(where: { $0.uid == e.micUID })?.id
+                guard let dev else { statusByEdge[id] = "マイクが見つかりません"; return false }
+                engines[id] = try MicInEdge(deviceID: dev,
+                                            useDefault: e.micUID.isEmpty, bus: b)
+
+            case (.input, .babigoeOut):
+                let s = ShmInEdge(shmName: ShmReader.nameBabigoeOut, bus: b)
+                s.start(); engines[id] = s
+
+            case (.output, .splitter):
+                let s = ShmOutEdge(shmName: ShmSender.nameToSplitter, bus: b)
+                s.start(); engines[id] = s
+
+            case (.output, .babigoeIn):
+                let s = ShmOutEdge(shmName: ShmSender.nameBabigoeIn, bus: b)
+                s.start(); engines[id] = s
+
+            default:
+                statusByEdge[id] = "未対応のエッジ"; return false
             }
-            host = rule.sendHost; port = p
-        }
-        let hub = HubEngine(micDeviceID: micID, monitorDeviceID: monID,
-                            udpHost: host, udpPort: port)
-        do {
-            try hub.start()
-            hubEngines[rule.id] = hub
-            statusByRule[rule.id] = "稼働中: \(rule.displayIn) → babigoe → 4ksplitter"
-                + (rule.monitorEnabled ? " ＋モニタ" : "")
-                + (rule.udpEnabled ? " ＋UDP" : "")
-            return true
         } catch {
-            statusByRule[rule.id] = "開始失敗: \(error.localizedDescription)"
+            statusByEdge[id] = "開始失敗: \(error.localizedDescription)"
             return false
         }
+        statusByEdge[id] = "稼働中"
+        ensureTimer()
+        return true
     }
 
-    private func deactivate(ruleID: UUID) {
-        if let e = engines[ruleID] { e.stop(); engines[ruleID] = nil }
-        if let h = hubEngines[ruleID] { h.stop(); hubEngines[ruleID] = nil }
+    private func deactivate(_ id: UUID) {
+        if let e = engines[id] { e.stop(); engines[id] = nil }
+        maybeStopTimer()
     }
 
-    // MARK: - 永続化
+    // MARK: 診断タイマー（毎秒 per-edge）
+
+    private func ensureTimer() {
+        guard statusTimer == nil else { return }
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 1.0,
+                                           repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                for (id, eng) in self.engines {
+                    if let e = self.edges.first(where: { $0.id == id }) {
+                        self.statusByEdge[id] =
+                            "稼働中  \(e.displayLeft)→\(e.displayRight)  \(eng.diag)"
+                    }
+                }
+            }
+        }
+    }
+    private func maybeStopTimer() {
+        if engines.isEmpty { statusTimer?.invalidate(); statusTimer = nil }
+    }
+
+    // MARK: 永続化
 
     private func load() {
-        guard let data = try? Data(contentsOf: storeURL),
-              let decoded = try? JSONDecoder().decode([RoutingRule].self, from: data)
+        guard let d = try? Data(contentsOf: storeURL),
+              let v = try? JSONDecoder().decode([RouteEdge].self, from: d)
         else { return }
-        rules = decoded
+        edges = v
     }
-
     private func save() {
-        guard let data = try? JSONEncoder().encode(rules) else { return }
-        try? data.write(to: storeURL, options: .atomic)
+        guard let d = try? JSONEncoder().encode(edges) else { return }
+        try? d.write(to: storeURL, options: .atomic)
     }
 }

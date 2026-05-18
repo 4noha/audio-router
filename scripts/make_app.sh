@@ -53,10 +53,22 @@ cat > "$ROOT/dist/AudioRouter.entitlements" <<'ENT'
 </plist>
 ENT
 
-echo "==> ad-hoc codesign"
-codesign --force --deep --sign - \
-  --entitlements "$ROOT/dist/AudioRouter.entitlements" \
-  "$APP"
+# 安定署名: コード署名 ID があればそれで署名する。ad-hoc(`-`)は再ビルド毎に
+# cdhash が変わり macOS のマイク許可(TCC)が無効化され mic=0 になるため、
+# 安定した Designated Requirement を持つ署名 ID を優先する。無ければ ad-hoc。
+SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
+  | awk 'NR==1 && /\)/ {print $2}')"
+if [ -n "${SIGN_ID:-}" ]; then
+  echo "==> codesign with stable identity ${SIGN_ID}"
+  codesign --force --deep --sign "$SIGN_ID" \
+    --entitlements "$ROOT/dist/AudioRouter.entitlements" \
+    "$APP"
+else
+  echo "==> ad-hoc codesign (安定 ID なし: マイク許可は再ビルド毎に再付与要)"
+  codesign --force --deep --sign - \
+    --entitlements "$ROOT/dist/AudioRouter.entitlements" \
+    "$APP"
+fi
 
 echo "==> done: $APP"
 echo "起動: open \"$APP\"  （初回に音声捕捉の許可を与えること）"

@@ -2,9 +2,9 @@ import Foundation
 import CoreAudio
 import AudioToolbox
 
-/// プロセスタップ → private 集約デバイス → IOProc で対象アプリの出力音声を捕捉し、
-/// モノラル Float32 にダウンミックスして UDP(PCMSender) と任意のモニタへ分配する。
-/// macOS 14.4+ 専用。
+/// プロセスタップ → private 集約デバイス → IOProc で対象アプリの出力音声を
+/// 捕捉し mono Float32 化する。パッチベイ用途では `startCapture` で
+/// `onMono` クロージャへ流すだけ（sender/shm/monitor は使わない）。macOS 14.4+。
 @available(macOS 14.4, *)
 public final class ProcessTapEngine: @unchecked Sendable {
 
@@ -33,37 +33,36 @@ public final class ProcessTapEngine: @unchecked Sendable {
     private var ioProcID: AudioDeviceIOProcID?
     private let ioQueue = DispatchQueue(label: "audio-router.ioproc", qos: .userInteractive)
 
-    private var sender: PCMSender?
-    private var shm: ShmSender?
-    private var monitor: AudioMonitor?
     private var sourceChannels = 2
     private var sampleRate: Double = 48_000
 
     public private(set) var isRunning = false
 
+    /// パッチベイ: mono Float32 とサンプルレートをここへ流す（バスへ書く）。
+    public var onMono: ((UnsafeBufferPointer<Float>, Double) -> Void)?
+
     public init() {}
 
-    /// 捕捉開始。`processObject` は ProcessEnumerator.processObject(for:) の値。
-    public func start(processObject: AudioObjectID,
-                      sendHost: String, sendPort: UInt16,
-                      monitorDevice: AudioObjectID?) throws {
+    /// 捕捉のみ開始（パッチベイ用）。音は `onMono` へ。
+    /// muteSource=true で元アプリをタップ中ミュート（切り分け用）。
+    public func startCapture(processObject: AudioObjectID,
+                             muteSource: Bool) throws {
         stop()
+        try openTap(processObject: processObject, muteSource: muteSource)
+        isRunning = true
+    }
 
-        // 1) タップ記述（モノミックスダウン・private）。
-        //    モニタ ON 時は元アプリ出力をミュートして二重再生を防ぐ
-        //    （モニタ側デバイスへ一本化）。OFF 時は元アプリの音を残す。
-        let desc = CATapDescription(
-            monoMixdownOfProcesses: [processObject])
+    private func openTap(processObject: AudioObjectID, muteSource: Bool) throws {
+        let desc = CATapDescription(monoMixdownOfProcesses: [processObject])
         desc.name = "AudioRouter Tap"
         desc.isPrivate = true
-        desc.muteBehavior = (monitorDevice != nil) ? .mutedWhenTapped : .unmuted
+        desc.muteBehavior = muteSource ? .mutedWhenTapped : .unmuted
 
         var tap = AudioObjectID(0)
         let ts = AudioHardwareCreateProcessTap(desc, &tap)
         guard ts == noErr, tap != 0 else { throw EngineError.createTapFailed(ts) }
         tapID = tap
 
-        // 2) タップの UID と フォーマット
         guard let tapUID = CA.string(tapID, kAudioTapPropertyUID) else {
             cleanup(); throw EngineError.tapFormatUnavailable
         }
@@ -73,7 +72,6 @@ public final class ProcessTapEngine: @unchecked Sendable {
             sourceChannels = Int(max(asbd.mChannelsPerFrame, 1))
         }
 
-        // 3) private 集約デバイス（タップのみを含む）
         let aggUID = "AudioRouter-Agg-\(UUID().uuidString)"
         let aggDict: [String: Any] = [
             kAudioAggregateDeviceNameKey as String: "AudioRouter-Aggregate",
@@ -96,16 +94,6 @@ public final class ProcessTapEngine: @unchecked Sendable {
         }
         aggregateID = agg
 
-        // 4) 出力先（UDP / モニタ）
-        sender = PCMSender(host: sendHost, port: sendPort,
-                           channels: 1, sampleRate: UInt32(sampleRate))
-        shm = ShmSender(srcSampleRate: sampleRate) // 4ksplitter は共有メモリ受信
-        if let monitorDevice {
-            monitor = AudioMonitor(deviceID: monitorDevice, sampleRate: sampleRate)
-            try? monitor?.start()
-        }
-
-        // 5) IOProc（入力 = タップ音声）
         var procID: AudioDeviceIOProcID?
         let cs = AudioDeviceCreateIOProcIDWithBlock(
             &procID, aggregateID, ioQueue
@@ -119,8 +107,6 @@ public final class ProcessTapEngine: @unchecked Sendable {
 
         let st = AudioDeviceStart(aggregateID, procID)
         guard st == noErr else { cleanup(); throw EngineError.startFailed(st) }
-
-        isRunning = true
     }
 
     public func stop() {
@@ -129,8 +115,6 @@ public final class ProcessTapEngine: @unchecked Sendable {
             AudioDeviceDestroyIOProcID(aggregateID, ioProcID)
         }
         ioProcID = nil
-        monitor?.stop(); monitor = nil
-        sender?.stop(); sender = nil
         cleanup()
         isRunning = false
     }
@@ -146,13 +130,12 @@ public final class ProcessTapEngine: @unchecked Sendable {
         }
     }
 
-    /// realtime IOProc: タップ音声を mono Float32 化して分配。
+    /// realtime IOProc: タップ音声を mono Float32 化して onMono へ。
     private func handleInput(_ list: UnsafePointer<AudioBufferList>) {
         let abl = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: list))
         guard abl.count > 0 else { return }
 
-        // mono mixdown 指定なので通常 1 buffer / 1ch だが、安全に汎用化。
         let first = abl[0]
         guard let raw = first.mData else { return }
         let chans = Int(max(first.mNumberChannels, 1))
@@ -162,10 +145,7 @@ public final class ProcessTapEngine: @unchecked Sendable {
         let frames = totalFloats / chans
 
         if chans == 1 {
-            let buf = UnsafeBufferPointer(start: src, count: frames)
-            sender?.send(buf)
-            shm?.send(buf)
-            monitor?.enqueue(buf)
+            onMono?(UnsafeBufferPointer(start: src, count: frames), sampleRate)
         } else {
             var mono = [Float](repeating: 0, count: frames)
             for f in 0..<frames {
@@ -173,11 +153,7 @@ public final class ProcessTapEngine: @unchecked Sendable {
                 for c in 0..<chans { acc += src[f * chans + c] }
                 mono[f] = acc / Float(chans)
             }
-            mono.withUnsafeBufferPointer { buf in
-                sender?.send(buf)
-                shm?.send(buf)
-                monitor?.enqueue(buf)
-            }
+            mono.withUnsafeBufferPointer { onMono?($0, sampleRate) }
         }
     }
 }

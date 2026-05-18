@@ -1,5 +1,7 @@
+import Foundation
 import Darwin
 import Dispatch
+import CShmCompat
 
 /// 捕捉した mono Float32 を 4ksplitter へ POSIX 共有メモリ(ARPS v1)で渡す。
 /// audio-router の「多経路」の 1 つ（UDP/モニタと並列に使う）。IP/ポート不使用、
@@ -12,8 +14,8 @@ import Dispatch
 ///   受信側 4ksplitter が所有・初期化・破棄。本 writer は attach のみ（O_CREAT
 ///   しない）、不健全時は 1s ゲートで再接続。
 public final class ShmSender: @unchecked Sendable {
-    public static let nameToSplitter = "/4ksp.voice"   // 4ksplitter 受信
-    public static let nameBabigoeIn  = "/babigoe.in"   // babigoe へ mic 供給
+    public static let nameToSplitter = "/4ksp.voice3"  // 4ksplitter 受信
+    public static let nameBabigoeIn  = "/babigoe.in3"  // babigoe へ mic 供給
     private let name: String
     private static let magic: Int32 = 0x5350_5241   // "ARPS" LE
     private static let version: Int32 = 1
@@ -27,15 +29,8 @@ public final class ShmSender: @unchecked Sendable {
                        offChannels = 12, offCapacity = 16, offReady = 20,
                        offWrite = 32, offRead = 40
 
-    // shm_open は C 可変長引数のため Swift から直接呼べない。
-    // O_CREAT を使わない attach 専用なので可変長部は空 → 固定引数の
-    // C 関数ポインタとして dlsym で解決して呼ぶ（ABI 安全）。
-    private typealias ShmOpenFn = @convention(c) (UnsafePointer<CChar>, Int32) -> Int32
-    private static let shmOpen: ShmOpenFn? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "shm_open")
-        else { return nil }                       // -2 = RTLD_DEFAULT (macOS)
-        return unsafeBitCast(sym, to: ShmOpenFn.self)
-    }()
+    // shm 作成は本 writer(Swift=C シム)が一手に担い、正しい mode(0666)で
+    // 生成＋ヘッダ初期化する。C# 側(4ksplitter/babigoe)は attach のみ。
     private nonisolated(unsafe) static let mapFailed =
         UnsafeMutableRawPointer(bitPattern: -1)
 
@@ -43,6 +38,17 @@ public final class ShmSender: @unchecked Sendable {
     private var fd: Int32 = -1
     private var lastTryNs: UInt64 = 0
     private var connected = false
+
+    // 診断（RouterController が UI 行に毎秒表示）。
+    private let dlock = NSLock()
+    private var _sent = 0
+    private var _connDiag = false
+    private var _lastErrno: Int32 = 0
+    public var statusLine: String {
+        dlock.lock(); defer { dlock.unlock() }
+        return _connDiag ? "shm conn=Y sent=\(_sent)"
+                         : "shm conn=N err=\(_lastErrno)"
+    }
 
     // ストリーミング線形リサンプラ状態（srcRate→48k, ブロック跨ぎ連続）
     private let srcRate: Double
@@ -56,6 +62,11 @@ public final class ShmSender: @unchecked Sendable {
         self.srcRate = srcSampleRate > 0 ? srcSampleRate : Self.outRate
         self.step = self.srcRate / Self.outRate
     }
+
+    /// データ到来前でも shm を作成・初期化して所有しておく（受信側が
+    /// すぐ attach できるよう、OUT エッジ start 時/毎 tick に呼ぶ）。
+    /// 接続済みなら即 return（軽量）。
+    public func open() { _ = ensureConnected() }
 
     public func stop() {
         detach()
@@ -93,6 +104,7 @@ public final class ShmSender: @unchecked Sendable {
         OSMemoryBarrier()
         storeI64(base, Self.offWrite, w + Int64(outN))
         OSMemoryBarrier()
+        dlock.lock(); _sent += outN; dlock.unlock()
     }
 
     // [prevLast, samples...] を仮想入力列とみなし線形補間で 48k 化。
@@ -121,42 +133,55 @@ public final class ShmSender: @unchecked Sendable {
         return outN
     }
 
-    // 共有領域へ attach。未接続/不健全なら 1s ゲートで再試行。
+    // 共有領域を作成(C シムで正規 mode 0666)＋ヘッダ初期化して所有。
+    // 未接続なら 1s ゲートで再試行。
     private func ensureConnected() -> Bool {
-        if connected, base != nil, healthy() { return true }
+        if connected, base != nil { return true }
 
         let now = DispatchTime.now().uptimeNanoseconds
         if now &- lastTryNs < 1_000_000_000 { return false }
         lastTryNs = now
 
         detach()
-        guard let shmOpen = Self.shmOpen else { return false }
-        let f = name.withCString { shmOpen($0, O_RDWR) } // 作成しない
-        if f < 0 { return false }
+        var f = name.withCString { cshm_open_rw($0) }     // 既存を開く
+        var freshlyCreated = false
+        if f < 0 {
+            f = name.withCString { cshm_open_create($0) } // O_CREAT mode0666
+            if f < 0 {
+                dlock.lock(); _lastErrno = errno; dlock.unlock()
+                return false
+            }
+            _ = ftruncate(f, off_t(Self.totalBytes))
+            freshlyCreated = true
+        }
         let p = mmap(nil, Self.totalBytes,
                      PROT_READ | PROT_WRITE, MAP_SHARED, f, 0)
         if p == nil || p == Self.mapFailed { close(f); return false }
         fd = f
         base = p
-        if !healthy() { detach(); return false }
-        // sampleRate は 48k 固定（writer 側でリサンプル済）。受信側と一致。
-        storeI32(p!, Self.offRate, Int32(Self.outRate))
-        connected = true
-        return true
-    }
 
-    private func healthy() -> Bool {
-        guard let b = base else { return false }
-        return loadI32(b, Self.offMagic) == Self.magic
-            && loadI32(b, Self.offVersion) == Self.version
-            && loadI32(b, Self.offCapacity) == Int32(Self.capacity)
-            && loadI32(b, Self.offReady) == 1
+        // 新規 or 未初期化(magic 不一致)ならヘッダ初期化（最後に ready=1）。
+        if freshlyCreated || loadI32(p!, Self.offMagic) != Self.magic {
+            storeI32(p!, Self.offVersion, Self.version)
+            storeI32(p!, Self.offRate, Int32(Self.outRate))
+            storeI32(p!, Self.offChannels, 1)
+            storeI32(p!, Self.offCapacity, Int32(Self.capacity))
+            storeI64(p!, Self.offWrite, 0)
+            storeI64(p!, Self.offRead, 0)
+            storeI32(p!, Self.offMagic, Self.magic)
+            OSMemoryBarrier()
+            storeI32(p!, Self.offReady, 1)
+        }
+        connected = true
+        dlock.lock(); _connDiag = true; dlock.unlock()
+        return true
     }
 
     private func detach() {
         if let b = base { munmap(b, Self.totalBytes); base = nil }
         if fd >= 0 { close(fd); fd = -1 }
         connected = false
+        dlock.lock(); _connDiag = false; dlock.unlock()
     }
 
     // raw メモリ R/W（memcpy でアライメント非依存）。

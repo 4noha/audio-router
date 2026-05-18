@@ -10,8 +10,13 @@ let package = Package(
         .macOS(.v14)
     ],
     targets: [
+        // shm_open(O_CREAT) を正しい C 可変長で呼ぶための C シム。
         .target(
-            name: "AudioRouterCore"
+            name: "CShmCompat"
+        ),
+        .target(
+            name: "AudioRouterCore",
+            dependencies: ["CShmCompat"]
         ),
         .executableTarget(
             name: "AudioRouterApp",
