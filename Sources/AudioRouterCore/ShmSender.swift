@@ -27,6 +27,7 @@ public final class ShmSender: @unchecked Sendable {
     // ヘッダオフセット
     private static let offMagic = 0, offVersion = 4, offRate = 8,
                        offChannels = 12, offCapacity = 16, offReady = 20,
+                       offConsumerPid = 24,
                        offWrite = 32, offRead = 40
 
     // shm 作成は本 writer(Swift=C シム)が一手に担い、正しい mode(0666)で
@@ -48,6 +49,27 @@ public final class ShmSender: @unchecked Sendable {
         dlock.lock(); defer { dlock.unlock() }
         return _connDiag ? "shm conn=Y sent=\(_sent)"
                          : "shm conn=N err=\(_lastErrno)"
+    }
+    /// 累積送出フレーム数（こちらが書いた量。受信側の有無は不問）。
+    public var sentFrames: Int { dlock.lock(); defer { dlock.unlock() }; return _sent }
+    /// 受信側が読み進めた累積フレーム数（readIndex）。受信側(4ksplitter等)
+    /// が止まると進まない＝「相手が実際に受信しているか」の判定に使う。
+    public var consumedFrames: Int {
+        guard let b = base else { return 0 }
+        return Int(loadI64(b, Self.offRead))
+    }
+    /// 受信側が公開した PID（未 attach なら 0）。
+    public var consumerPid: Int32 {
+        guard let b = base else { return 0 }
+        return loadI32(b, Self.offConsumerPid)
+    }
+    /// 受信プロセスが生存しているか（kill(pid,0) で直接確認）。
+    /// pid 未公開(0)＝まだ誰も繋がっていない → false。
+    public var consumerAlive: Bool {
+        let pid = consumerPid
+        guard pid > 0 else { return false }
+        if kill(pid_t(pid), 0) == 0 { return true }
+        return errno == EPERM   // EPERM=存在(権限差) / ESRCH=不在
     }
 
     // ストリーミング線形リサンプラ状態（srcRate→48k, ブロック跨ぎ連続）

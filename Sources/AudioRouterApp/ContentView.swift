@@ -73,39 +73,101 @@ private func card<C: View>(@ViewBuilder _ c: () -> C) -> some View {
             .fill(Color(nsColor: .controlBackgroundColor)))
 }
 
-// MARK: - Routing（エッジ一覧）
+/// 稼働中インジケータ：緑の ♻ を 0.5 秒ごとに 45° カクッと回す
+/// （補間なしの段階回転）。
+@available(macOS 14.4, *)
+struct Spinner: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+            let step = Int(ctx.date.timeIntervalSinceReferenceDate / 0.5) % 8
+            Text("♻")
+                .foregroundStyle(.green)
+                .rotationEffect(.degrees(Double(step) * 45))
+        }
+    }
+}
+
+/// 行に流す波形ストリップ：直近 64 ブロックのピークを左へ流す（~20fps）。
+/// リングが進む（音が流れる）と中身が左へ送られて波形が流れて見える。
+@available(macOS 14.4, *)
+struct WaveStrip: View {
+    let provider: () -> (data: [Float], frac: Float)
+    var body: some View {
+        // .animation はディスプレイのリフレッシュに同期して毎フレーム
+        // 確実に再描画する（.periodic の微小 interval は環境により
+        // 間引かれ ~1Hz に落ちることがあるため使わない）。push ≈25Hz
+        // の合間も frac(0..1, 実測レート補間) ぶん波形全体をサブピクセル
+        // 左送りし続け、毎フレーム別の絵になり連続的に流れる。点が
+        // 少ないぶんは二次曲線でスムージング。
+        TimelineView(.animation) { context in
+            Canvas { ctx, size in
+                let _ = context.date          // 毎フレーム無効化を保証
+                let (s, frac) = provider()
+                guard s.count > 2 else { return }
+                let n = s.count
+                let midY = size.height / 2
+                let maxA = size.height / 2 - 1
+                // off=frac は [0,1]。両端に 1〜2 本ぶん余白を持たせ、新しい
+                // 波が右端外から入り古い波が左端外へ抜ける（隙間は出ない）。
+                let stepX = size.width / CGFloat(n - 3)
+                let off = CGFloat(frac)
+                func pt(_ i: Int, up: Bool) -> CGPoint {
+                    let a = max(0.5, CGFloat(min(max(s[i], 0), 1)) * maxA)
+                    return CGPoint(x: (CGFloat(i) - off) * stepX,
+                                   y: up ? midY - a : midY + a)
+                }
+                let top = (0..<n).map { pt($0, up: true) }
+                let bot = (0..<n).map { pt($0, up: false) }
+                var shape = Path()                       // 上輪郭→下輪郭で閉領域
+                shape.move(to: top[0])
+                for i in 1..<n {                          // 中点経由の二次曲線
+                    let m = CGPoint(x: (top[i - 1].x + top[i].x) / 2,
+                                    y: (top[i - 1].y + top[i].y) / 2)
+                    shape.addQuadCurve(to: m, control: top[i - 1])
+                }
+                shape.addLine(to: top[n - 1])
+                shape.addLine(to: bot[n - 1])
+                for i in stride(from: n - 1, to: 0, by: -1) {
+                    let m = CGPoint(x: (bot[i].x + bot[i - 1].x) / 2,
+                                    y: (bot[i].y + bot[i - 1].y) / 2)
+                    shape.addQuadCurve(to: m, control: bot[i])
+                }
+                shape.addLine(to: bot[0])
+                shape.closeSubpath()
+                ctx.fill(shape, with: .color(.green.opacity(0.55)))
+            }
+        }
+        .frame(width: 80, height: 40)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .background(RoundedRectangle(cornerRadius: 4)
+            .fill(Color.black.opacity(0.06)))
+        .help("流量波形（右から左へ滑らかに流れる・直近約1.2秒）")
+    }
+}
+
+// MARK: - Routing（1 行 = source ‐ bus ‐ sink）
 
 @available(macOS 14.4, *)
 struct RoutingView: View {
     @ObservedObject var ctl: RouterController
-    @State private var editing = RouteEdge(role: .input, endpoint: .appTap)
+    @State private var editing = RouteRow()
     @State private var isNew = false
     @State private var showEditor = false
-
-    private func add(_ role: EdgeRole, _ ep: EdgeEndpoint) {
-        var e = RouteEdge(role: role, endpoint: ep)
-        e.busName = ctl.busNames.first ?? "bus1"
-        editing = e; isNew = true; ctl.refreshLists(); showEditor = true
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             PaneHeader(title: "Audio Router — Patchbay",
-                       subtitle: "IN→[bus] / [bus]→OUT を個別トグルで結線")
+                       subtitle: "1 行 = source ‐ bus ‐ sink。片側だけ・同名 bus 共有で分岐(fan-out)可")
 
             HStack(spacing: 10) {
-                Menu {
-                    Button("アプリ → bus") { add(.input, .appTap) }
-                    Button("マイク → bus") { add(.input, .mic) }
-                    Button("babigoe(出力) → bus") { add(.input, .babigoeOut) }
-                } label: { Label("IN を追加", systemImage: "plus.circle.fill") }
-                    .menuStyle(.borderlessButton).fixedSize()
-
-                Menu {
-                    Button("bus → 4ksplitter") { add(.output, .splitter) }
-                    Button("bus → babigoe(入力)") { add(.output, .babigoeIn) }
-                } label: { Label("OUT を追加", systemImage: "plus.circle") }
-                    .menuStyle(.borderlessButton).fixedSize()
+                Button {
+                    var r = RouteRow()
+                    r.bus = ctl.busNames.first ?? "bus1"
+                    r.source = .appTap; r.sink = .splitter
+                    editing = r; isNew = true
+                    ctl.refreshLists(); showEditor = true
+                } label: { Label("ルートを追加", systemImage: "plus.circle.fill") }
+                    .buttonStyle(.borderedProminent)
 
                 Button { ctl.refreshLists() } label: {
                     Label("一覧更新", systemImage: "arrow.clockwise")
@@ -114,60 +176,92 @@ struct RoutingView: View {
             }
             .padding(.horizontal, 24).padding(.bottom, 18)
 
-            if ctl.edges.isEmpty {
+            if ctl.rows.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "arrow.triangle.branch")
                         .font(.largeTitle).foregroundStyle(.tertiary)
-                    Text("エッジがありません").foregroundStyle(.secondary)
-                    Text("IN（アプリ/マイク/babigoe）と OUT（4ksplitter/babigoe）を追加し、同じ bus 名で繋ぎます。")
+                    Text("ルートがありません").foregroundStyle(.secondary)
+                    Text("「ルートを追加」で source ‐ bus ‐ sink を1行で定義。"
+                         + "同じ bus 名を複数行で使うと分岐します。")
                         .font(.caption).foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     VStack(spacing: 10) {
-                        ForEach(ctl.edges) { e in row(e) }
+                        ForEach(ctl.rows) { r in row(r) }
                     }.padding(.horizontal, 24).padding(.bottom, 24)
                 }
             }
         }
         .sheet(isPresented: $showEditor) {
-            EdgeEditorView(ctl: ctl, original: editing, isNew: isNew) { saved in
-                if isNew { ctl.addEdge(saved) } else { ctl.updateEdge(saved) }
+            RouteEditorView(ctl: ctl, original: editing, isNew: isNew) { saved in
+                if isNew { ctl.addRow(saved) } else { ctl.updateRow(saved) }
             }
         }
     }
 
-    private func row(_ e: RouteEdge) -> some View {
-        card {
-            HStack(spacing: 14) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 8) {
-                        Label(e.displayLeft, systemImage: e.icon)
-                            .font(.body).bold().labelStyle(.titleAndIcon)
-                        Image(systemName: "arrow.right")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Text(e.displayRight).font(.body).foregroundStyle(.secondary)
-                        Text(e.role == .input ? "IN" : "OUT")
-                            .font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Capsule().fill(.quaternary))
+    // 設定された app/mic が現在の一覧に見つからない（=使えない）か。
+    private func sourceMissing(_ r: RouteRow) -> Bool {
+        switch r.source {
+        case .appTap:
+            return r.appBundleID.isEmpty
+                || !ctl.processes.contains { $0.bundleID == r.appBundleID }
+        case .mic:
+            return r.micUID.isEmpty
+                ? ctl.inputs.isEmpty
+                : !ctl.inputs.contains { $0.uid == r.micUID }
+        case .babigoeOut, .none:
+            return false
+        }
+    }
+
+    // IN/OUT のインジケータ: 流れていれば回転♻、稼働中だが無信号は静止♻。
+    @ViewBuilder
+    private func indicator(active: Bool, flowing: Bool) -> some View {
+        if flowing {
+            Spinner()                                   // 信号あり→回転
+        } else if active {
+            Text("♻").foregroundStyle(.secondary)       // 稼働中だが無信号→静止
+        }
+    }
+
+    private func row(_ r: RouteRow) -> some View {
+        let on = ctl.active(r.id)
+        let missing = sourceMissing(r)
+        let flow = ctl.flowByRow[r.id] ?? RouterController.RowFlow()
+        return card {
+            HStack(spacing: 6) {
+                Image(systemName: r.icon).foregroundStyle(.secondary)
+                if let s = r.displaySource {
+                    Text(s).font(.body).bold()
+                    if missing {
+                        Text("🚫").help("デバイス/アプリが見つかりません")
+                    } else {
+                        indicator(active: on, flowing: flow.inFlow)
                     }
-                    if let s = ctl.statusByEdge[e.id], !s.isEmpty {
-                        Text(s).font(.caption2)
-                            .foregroundStyle(ctl.active(e.id) ? .green : .orange)
-                            .lineLimit(1)
+                }
+                Text("‐ \(r.busLabel)").font(.body).foregroundStyle(.secondary)
+                if let k = r.displaySink {
+                    Text("‐").font(.body).foregroundStyle(.secondary)
+                    Text(k).font(.body).bold()
+                    if flow.sinkDown {
+                        Text("🚫").help("受信側(4ksplitter等)が閉じています")
+                    } else {
+                        indicator(active: on, flowing: flow.outFlow)
                     }
                 }
                 Spacer()
+                if on && r.sink == .recorder { WaveStrip { ctl.wavePhased(r.id) } }
                 Toggle("", isOn: Binding(
-                    get: { ctl.active(e.id) },
-                    set: { ctl.setEnabled(e.id, $0) }))
+                    get: { ctl.active(r.id) },
+                    set: { ctl.setEnabled(r.id, $0) }))
                     .toggleStyle(.switch).labelsHidden().tint(.blue)
                 Button {
-                    editing = e; isNew = false; ctl.refreshLists(); showEditor = true
+                    editing = r; isNew = false; ctl.refreshLists(); showEditor = true
                 } label: { Label("編集", systemImage: "pencil") }
-                    .buttonStyle(.bordered).disabled(ctl.active(e.id))
-                Button(role: .destructive) { ctl.deleteEdge(e.id) } label: {
+                    .buttonStyle(.bordered).disabled(on)
+                Button(role: .destructive) { ctl.deleteRow(r.id) } label: {
                     Image(systemName: "trash")
                 }.buttonStyle(.bordered).tint(.red)
             }
@@ -175,16 +269,18 @@ struct RoutingView: View {
     }
 }
 
-// MARK: - エッジ編集
+// MARK: - ルート編集（source 任意 / bus / sink 任意）
 
 @available(macOS 14.4, *)
-struct EdgeEditorView: View {
+struct RouteEditorView: View {
     @ObservedObject var ctl: RouterController
-    let original: RouteEdge
+    let original: RouteRow
     let isNew: Bool
-    let onSave: (RouteEdge) -> Void
+    let onSave: (RouteRow) -> Void
     @Environment(\.dismiss) private var dismiss
 
+    @State private var src: SourceKind? = nil
+    @State private var snk: SinkKind? = nil
     @State private var busName = "bus1"
     @State private var appBundleID = ""
     @State private var appName = ""
@@ -192,23 +288,25 @@ struct EdgeEditorView: View {
     @State private var micUID = ""
     @State private var micName = ""
 
-    private var role: EdgeRole { original.role }
-    private var ep: EdgeEndpoint { original.endpoint }
     private var canSave: Bool {
-        if ep == .appTap { return !appBundleID.isEmpty }
+        guard src != nil || snk != nil else { return false }
+        if src == .appTap { return !appBundleID.isEmpty }
         return true
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text((isNew ? "エッジを追加" : "エッジを編集")
-                 + "（\(role == .input ? "IN" : "OUT"): "
-                 + "\(role == .input ? ep.label + "→bus" : "bus→" + ep.label)）")
-                .font(.title3).bold()
+        VStack(alignment: .leading, spacing: 14) {
+            Text(isNew ? "ルートを追加" : "ルートを編集").font(.title3).bold()
 
-            if ep == .appTap {
-                GroupBox("ソース — アプリ（音声出力中）") {
-                    VStack(alignment: .leading, spacing: 8) {
+            GroupBox("IN — source（バスへ書く側・任意）") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("ソース", selection: $src) {
+                        Text("なし").tag(SourceKind?.none)
+                        Text("アプリ").tag(SourceKind?.some(.appTap))
+                        Text("マイク").tag(SourceKind?.some(.mic))
+                        Text("babigoe(出力)").tag(SourceKind?.some(.babigoeOut))
+                    }
+                    if src == .appTap {
                         Picker("アプリ", selection: $appBundleID) {
                             Text("選択してください").tag("")
                             if !appBundleID.isEmpty,
@@ -226,14 +324,7 @@ struct EdgeEditorView: View {
                         }
                         Toggle("元アプリをミュート（タップ中スピーカーに出さない）",
                                isOn: $muteSource)
-                        Button { ctl.refreshLists() } label: {
-                            Label("一覧更新", systemImage: "arrow.clockwise")
-                        }
-                    }.padding(6)
-                }
-            } else if ep == .mic {
-                GroupBox("ソース — マイク") {
-                    VStack(alignment: .leading, spacing: 8) {
+                    } else if src == .mic {
                         Picker("マイク", selection: $micUID) {
                             Text("既定の入力").tag("")
                             if !micUID.isEmpty,
@@ -247,23 +338,17 @@ struct EdgeEditorView: View {
                                 micName = d.name
                             }
                         }
-                        Button { ctl.refreshLists() } label: {
-                            Label("一覧更新", systemImage: "arrow.clockwise")
-                        }
-                    }.padding(6)
-                }
-            } else {
-                GroupBox(role == .input
-                         ? "ソース — babigoe 処理済(/babigoe.out)"
-                         : "シンク — \(ep == .splitter ? "4ksplitter(/4ksp.voice)" : "babigoe 入力(/babigoe.in)")") {
-                    Text(role == .input
-                         ? "babigoe が書く処理済み音声を読み取り bus へ流します。"
-                         : "bus の音声を共有メモリへ送出します。")
-                        .font(.caption).foregroundStyle(.secondary).padding(6)
-                }
+                    } else if src == .babigoeOut {
+                        Text("babigoe が書く処理済み音声(/babigoe.out)を bus へ。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button { ctl.refreshLists() } label: {
+                        Label("一覧更新", systemImage: "arrow.clockwise")
+                    }
+                }.padding(6)
             }
 
-            GroupBox("バス（同じ名前の IN と OUT が繋がります）") {
+            GroupBox("BUS（同名の行どうしが繋がる／複数行で分岐）") {
                 HStack {
                     Text("bus 名")
                     TextField("bus1", text: $busName).frame(width: 160)
@@ -277,27 +362,42 @@ struct EdgeEditorView: View {
                 }.padding(6)
             }
 
+            GroupBox("OUT — sink（バスから読む側・任意）") {
+                Picker("シンク", selection: $snk) {
+                    Text("なし").tag(SinkKind?.none)
+                    Text("4ksplitter").tag(SinkKind?.some(.splitter))
+                    Text("babigoe(入力)").tag(SinkKind?.some(.babigoeIn))
+                    Text("録音(WAV ファイル)").tag(SinkKind?.some(.recorder))
+                }.padding(6)
+            }
+
+            Text("source も sink も無し は不可。片側だけなら部分ルート"
+                 + "（例: VLC ‐ bus2 / bus2 ‐ 4ksplitter）。")
+                .font(.caption2).foregroundStyle(.tertiary)
+
             HStack {
                 Spacer()
                 Button("キャンセル") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(isNew ? "追加" : "保存") {
-                    var e = original
-                    e.busName = busName.isEmpty ? "bus1" : busName
-                    e.appBundleID = appBundleID
-                    e.appName = appName.isEmpty ? appBundleID : appName
-                    e.muteSource = muteSource
-                    e.micUID = micUID
-                    e.micName = micName
-                    onSave(e); dismiss()
+                    var r = original
+                    r.source = src; r.sink = snk
+                    r.bus = busName.isEmpty ? "bus1" : busName
+                    r.appBundleID = appBundleID
+                    r.appName = appName.isEmpty ? appBundleID : appName
+                    r.muteSource = muteSource
+                    r.micUID = micUID
+                    r.micName = micName
+                    onSave(r); dismiss()
                 }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                 .disabled(!canSave)
             }
         }
-        .padding(22).frame(width: 480)
+        .padding(22).frame(width: 500)
         .onAppear {
             ctl.refreshLists()
-            busName = original.busName
+            src = original.source; snk = original.sink
+            busName = original.bus
             appBundleID = original.appBundleID
             appName = original.appName
             muteSource = original.muteSource
@@ -314,19 +414,19 @@ struct ActivityView: View {
     @ObservedObject var ctl: RouterController
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            PaneHeader(title: "Activity", subtitle: "各エッジの稼働と流量（毎秒更新）")
+            PaneHeader(title: "Activity", subtitle: "各ルートの稼働と流量（毎秒更新）")
             ScrollView {
                 VStack(spacing: 10) {
-                    ForEach(ctl.edges) { e in
+                    ForEach(ctl.rows) { r in
                         card {
                             HStack(spacing: 12) {
                                 Circle()
-                                    .fill(ctl.active(e.id) ? Color.green : Color.gray)
+                                    .fill(ctl.active(r.id) ? Color.green : Color.gray)
                                     .frame(width: 9, height: 9)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("\(e.displayLeft) → \(e.displayRight)").bold()
-                                    Text(ctl.statusByEdge[e.id]
-                                         ?? (ctl.active(e.id) ? "稼働中" : "停止中"))
+                                    Text(r.oneLine).bold()
+                                    Text(ctl.statusByRow[r.id]
+                                         ?? (ctl.active(r.id) ? "稼働中" : "停止中"))
                                         .font(.caption).foregroundStyle(.secondary)
                                         .lineLimit(2)
                                 }
@@ -334,8 +434,8 @@ struct ActivityView: View {
                             }
                         }
                     }
-                    if ctl.edges.isEmpty {
-                        Text("エッジがありません").foregroundStyle(.secondary)
+                    if ctl.rows.isEmpty {
+                        Text("ルートがありません").foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity).padding(.top, 40)
                     }
                 }.padding(24)

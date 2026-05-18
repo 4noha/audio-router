@@ -21,6 +21,16 @@ let package = Package(
         .executableTarget(
             name: "AudioRouterApp",
             dependencies: ["AudioRouterCore"]
+        ),
+        // 動作検証用 CLI: 任意 ARPS shm を attach し JSON でヘッダ/流量出力。
+        .executableTarget(
+            name: "arps-probe",
+            dependencies: ["CShmCompat"]
+        ),
+        // E2E 合成音源 CLI: 指定 shm を作成し正弦波を書き込み続ける。
+        .executableTarget(
+            name: "arps-feed",
+            dependencies: ["CShmCompat"]
         )
     ]
 )
