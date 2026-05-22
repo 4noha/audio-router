@@ -187,11 +187,18 @@ struct RoutingView: View {
                         .multilineTextAlignment(.center)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    VStack(spacing: 10) {
-                        ForEach(ctl.rows) { r in row(r) }
-                    }.padding(.horizontal, 24).padding(.bottom, 24)
+                List {
+                    ForEach(ctl.rows) { r in
+                        row(r)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets(top: 5, leading: 24,
+                                                      bottom: 5, trailing: 24))
+                    }
+                    .onMove { from, to in ctl.moveRows(from: from, to: to) }
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
         }
         .sheet(isPresented: $showEditor) {
@@ -211,7 +218,7 @@ struct RoutingView: View {
             return r.micUID.isEmpty
                 ? ctl.inputs.isEmpty
                 : !ctl.inputs.contains { $0.uid == r.micUID }
-        case .babigoeOut, .none:
+        case .babigoeOut, .wirelessMic, .none:
             return false
         }
     }
@@ -287,6 +294,11 @@ struct RouteEditorView: View {
     @State private var muteSource = false
     @State private var micUID = ""
     @State private var micName = ""
+    @State private var splitterSlot: Int = 1   // 1..4。snk==.splitter のときだけ意味を持つ
+    @State private var obsKind: ObsKind = .mic // snk==.obs のときの枠種別（mic/video）
+    @State private var obsSlot: Int = 1        // 1..maxSlot。snk==.obs のときだけ意味を持つ
+    @State private var babigoeSlot: Int = 1    // 1..4。snk==.babigoeIn または src==.babigoeOut のときだけ
+    @State private var wirelessSlot: Int = 1   // 1..4。src==.wirelessMic のときだけ意味を持つ
 
     private var canSave: Bool {
         guard src != nil || snk != nil else { return false }
@@ -305,6 +317,7 @@ struct RouteEditorView: View {
                         Text("アプリ").tag(SourceKind?.some(.appTap))
                         Text("マイク").tag(SourceKind?.some(.mic))
                         Text("babigoe(出力)").tag(SourceKind?.some(.babigoeOut))
+                        Text("ワイヤレスマイク(Android)").tag(SourceKind?.some(.wirelessMic))
                     }
                     if src == .appTap {
                         Picker("アプリ", selection: $appBundleID) {
@@ -339,8 +352,26 @@ struct RouteEditorView: View {
                             }
                         }
                     } else if src == .babigoeOut {
-                        Text("babigoe が書く処理済み音声(/babigoe.out)を bus へ。")
+                        Text("babigoe が書く処理済み音声を bus へ。"
+                             + "ch1 = `/babigoe.out3` (元バ美声)、"
+                             + "ch2..4 = `/babigoe.out3.<n>` (VST デッキ等)。")
                             .font(.caption).foregroundStyle(.secondary)
+                        Picker("babigoe チャンネル", selection: $babigoeSlot) {
+                            ForEach(1...4, id: \.self) {
+                                Text($0 == 1 ? "ch1 (元バ美声)" : "ch\($0)").tag($0)
+                            }
+                        }
+                    } else if src == .wirelessMic {
+                        Text("Bonjour `_4noha-audio._udp` で Android アプリが "
+                             + "接続→このスロットへ送ったマイク音を bus へ。"
+                             + "複数 Android を同時接続するなら別 slot へ。"
+                             + "（Android が HELLO で繋ぐとこの行は自動追加もされる）")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Picker("slot", selection: $wirelessSlot) {
+                            ForEach(1...4, id: \.self) {
+                                Text("slot \($0)").tag($0)
+                            }
+                        }
                     }
                     Button { ctl.refreshLists() } label: {
                         Label("一覧更新", systemImage: "arrow.clockwise")
@@ -363,11 +394,53 @@ struct RouteEditorView: View {
             }
 
             GroupBox("OUT — sink（バスから読む側・任意）") {
-                Picker("シンク", selection: $snk) {
-                    Text("なし").tag(SinkKind?.none)
-                    Text("4ksplitter").tag(SinkKind?.some(.splitter))
-                    Text("babigoe(入力)").tag(SinkKind?.some(.babigoeIn))
-                    Text("録音(WAV ファイル)").tag(SinkKind?.some(.recorder))
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("シンク", selection: $snk) {
+                        Text("なし").tag(SinkKind?.none)
+                        Text("4ksplitter").tag(SinkKind?.some(.splitter))
+                        Text("babigoe(入力)").tag(SinkKind?.some(.babigoeIn))
+                        Text("OBS").tag(SinkKind?.some(.obs))
+                        Text("ネットスピーカー(Android)").tag(SinkKind?.some(.netSpeaker))
+                        Text("録音(WAV ファイル)").tag(SinkKind?.some(.recorder))
+                    }
+                    // 4ksplitter のみモデル枠を選択（複数モデル独立リップシンクへの分岐）。
+                    // 枠1は従来の shm 名のままで既存ルートと完全後方互換。
+                    if snk == .splitter {
+                        Picker("モデル枠", selection: $splitterSlot) {
+                            ForEach(1...4, id: \.self) { Text("モデル \($0)").tag($0) }
+                        }
+                    }
+                    // babigoeIn 行きはチャンネル番号を選択（同 shm を複数アプリで取り合わない用）。
+                    // ch1 = `/babigoe.in3` (元バ美声向け)、ch2..4 = VST デッキ等。
+                    if snk == .babigoeIn {
+                        Picker("babigoe チャンネル", selection: $babigoeSlot) {
+                            ForEach(1...4, id: \.self) {
+                                Text($0 == 1 ? "ch1 (元バ美声)" : "ch\($0)").tag($0)
+                            }
+                        }
+                    }
+                    if snk == .netSpeaker {
+                        Text("接続中の全 Android へ Opus(AUDIO mode, 128kbps) で "
+                             + "ブロードキャスト。任意 bus を流せるので音楽・効果音含む "
+                             + "ミックスを Android で聴ける。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // OBS は枠種別(mic/video)＋ 枠番号(mic:1..4 / video:1..2)。
+                    // 種別を変えると最大枠数が変わるので slot を切り詰める。
+                    if snk == .obs {
+                        Picker("枠種別", selection: $obsKind) {
+                            Text("マイク (4 枠)").tag(ObsKind.mic)
+                            Text("映像音 (2 枠)").tag(ObsKind.video)
+                        }
+                        .onChange(of: obsKind) { _, k in
+                            if obsSlot > k.maxSlot { obsSlot = k.maxSlot }
+                        }
+                        Picker("枠番号", selection: $obsSlot) {
+                            ForEach(1...obsKind.maxSlot, id: \.self) {
+                                Text("\(obsKind.label) \($0)").tag($0)
+                            }
+                        }
+                    }
                 }.padding(6)
             }
 
@@ -387,6 +460,11 @@ struct RouteEditorView: View {
                     r.muteSource = muteSource
                     r.micUID = micUID
                     r.micName = micName
+                    r.splitterSlot = splitterSlot
+                    r.obsKind = obsKind
+                    r.obsSlot = obsSlot
+                    r.babigoeSlot = babigoeSlot
+                    r.wirelessSlot = wirelessSlot
                     onSave(r); dismiss()
                 }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
@@ -403,6 +481,11 @@ struct RouteEditorView: View {
             muteSource = original.muteSource
             micUID = original.micUID
             micName = original.micName
+            splitterSlot = original.splitterSlot
+            obsKind = original.obsKind
+            obsSlot = original.obsSlot
+            babigoeSlot = original.babigoeSlot
+            wirelessSlot = original.wirelessSlot
         }
     }
 }

@@ -258,6 +258,136 @@ final class ShmOutEdge: EdgeEngine {
     var diag: String { sender.statusLine }
 }
 
+// MARK: - IN: ワイヤレスマイク (NetAudioServer の slot bus) → bus
+
+/// `NetAudioServer.slotBuses[slot-1]` は server 内部で「受信＆ジッタバッファ
+/// pop 結果」が書かれている mono 48k Float32 AudioBus。それを reader で読んで
+/// このエッジが受け持つ bus に転記する。fan-out は router 側の bus 共有で実現。
+@available(macOS 14.4, *)
+final class WirelessMicInEdge: EdgeEngine {
+    private weak var server: NetAudioServer?
+    private let slot: Int
+    private let reader: AudioBus.Reader
+    private let bus: AudioBus
+    private var pump: DispatchSourceTimer?
+    private let q = DispatchQueue(label: "audio-router.edge.wirelessmic",
+                                  qos: .userInteractive)
+    private var pull = [Float](repeating: 0, count: 1024)
+    private let lk = NSLock()
+    private var got = 0
+    private var _lvl: Float = 0
+    private let wave = PeakRing()
+
+    init(server: NetAudioServer, slot: Int, bus: AudioBus) {
+        self.server = server
+        self.slot = slot
+        self.reader = server.slotBuses[slot - 1].makeReader()
+        self.bus = bus
+    }
+    func start() {
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + .milliseconds(5),
+                   repeating: .milliseconds(5), leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            let n = self.pull.withUnsafeMutableBufferPointer {
+                self.reader.read(into: $0)
+            }
+            guard n > 0 else { return }
+            var pk: Float = 0
+            for i in 0..<n { let a = abs(self.pull[i]); if a > pk { pk = a } }
+            self.pull.withUnsafeBufferPointer {
+                self.bus.write(UnsafeBufferPointer(
+                    start: $0.baseAddress, count: n))
+            }
+            self.wave.push(pk)
+            self.lk.lock()
+            self.got += n
+            if pk > self._lvl { self._lvl = pk }
+            self.lk.unlock()
+        }
+        t.resume()
+        pump = t
+    }
+    func stop() { pump?.cancel(); pump = nil }
+    var frames: Int { lk.lock(); defer { lk.unlock() }; return got }
+    var level: Float {
+        lk.lock(); defer { lk.unlock() }; let v = _lvl; _lvl = 0; return v
+    }
+    var waveform: [Float] { wave.snapshot() }
+    var waveFrac: Float { Float(wave.phase) }
+    var diag: String {
+        lk.lock(); let g = got; lk.unlock()
+        // server 側カウンタも併記。pkts=受信パケット数, drop=遅延 drop,
+        // lost=ロスト→PLC、host=最終送信元。受信が来ているのに recv が
+        // 上がらない場合は jitter buffer / opus decode が止まっている。
+        if let sd = server?.diag(slot: slot) {
+            let host = sd.peerHost ?? "-"
+            return "wirelessmic recv=\(g) pkts=\(sd.packetsIn) drop=\(sd.packetsDropped) lost=\(sd.packetsLost) host=\(host)"
+        }
+        return "wirelessmic recv=\(g)"
+    }
+}
+
+// MARK: - OUT: bus → ネットスピーカー（NetAudioBroadcaster で Opus 送信）
+
+@available(macOS 14.4, *)
+final class NetSpeakerOutEdge: EdgeEngine {
+    private let broadcaster: NetAudioBroadcaster
+    // NetAudioBroadcaster は bus reader を内部で作るので、外でも 1 つ作って
+    // ピーク監視に使う（diag 表示・流量判定用）。
+    private let monReader: AudioBus.Reader
+    private var pump: DispatchSourceTimer?
+    private let q = DispatchQueue(label: "audio-router.edge.netspk.mon",
+                                  qos: .utility)
+    private var pull = [Float](repeating: 0, count: 1024)
+    private let lk = NSLock()
+    private var _lvl: Float = 0
+    private let wave = PeakRing()
+    private var sentLast: Int64 = 0
+
+    init(server: NetAudioServer, bus: AudioBus) throws {
+        self.broadcaster = try NetAudioBroadcaster(server: server, bus: bus)
+        self.monReader = bus.makeReader()
+    }
+    func start() {
+        broadcaster.start()
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + .milliseconds(20),
+                   repeating: .milliseconds(20), leeway: .milliseconds(5))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            let n = self.pull.withUnsafeMutableBufferPointer {
+                self.monReader.read(into: $0)
+            }
+            guard n > 0 else { return }
+            var pk: Float = 0
+            for i in 0..<n { let a = abs(self.pull[i]); if a > pk { pk = a } }
+            self.wave.push(pk)
+            self.lk.lock()
+            if pk > self._lvl { self._lvl = pk }
+            self.lk.unlock()
+        }
+        t.resume()
+        pump = t
+    }
+    func stop() { pump?.cancel(); pump = nil; broadcaster.stop() }
+    var frames: Int {
+        let s = broadcaster.snapshot()
+        lk.lock(); sentLast = s.sentFrames; lk.unlock()
+        return Int(s.sentFrames)
+    }
+    var level: Float {
+        lk.lock(); defer { lk.unlock() }; let v = _lvl; _lvl = 0; return v
+    }
+    var waveform: [Float] { wave.snapshot() }
+    var waveFrac: Float { Float(wave.phase) }
+    var diag: String {
+        let s = broadcaster.snapshot()
+        return "netspk sent=\(s.sentFrames) bytes=\(s.bytesOut)"
+    }
+}
+
 // MARK: - OUT: bus → ファイル録音（WAV 16bit mono 48k）
 
 @available(macOS 14.4, *)
@@ -280,11 +410,15 @@ final class RecorderOutEdge: EdgeEngine {
 
     init(bus: AudioBus) {
         self.reader = bus.makeReader()
-        // 書込先: ~/Library/Application Support/AudioRouter/recordings/
-        // （非サンドボックス・TCC プロンプト無しの安全な場所）。
-        let dir = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AudioRouter/recordings", isDirectory: true)
+        // 書込先: ~/Music/AudioRouter/（Finder サイドバーから見えるユーザ
+        // 可視位置・音声録音として自然）。Music は macOS TCC 保護対象外
+        // なので非サンドボックスアプリでも許可ダイアログが出ない
+        // （Documents/Desktop/Downloads は初回プロンプトが出るため不可）。
+        // 取得不可な環境では Application Support にフォールバック。
+        let fm = FileManager.default
+        let base = fm.urls(for: .musicDirectory, in: .userDomainMask).first
+            ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("AudioRouter", isDirectory: true)
         try? FileManager.default.createDirectory(
             at: dir, withIntermediateDirectories: true)
         let df = DateFormatter(); df.dateFormat = "yyyyMMdd-HHmmss"

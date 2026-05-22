@@ -26,6 +26,10 @@ final class RouterController: ObservableObject {
     private var engines: [UUID: RowEng] = [:]         // 行ごと IN/OUT
     private var startedAt: [UUID: Date] = [:]         // 受信側 attach 猶予用
     private var buses: [String: AudioBus] = [:]
+    // ネットマイク/ネットスピーカー用 UDP/Bonjour ハブ。最初に必要になった
+    // 行がアクティベートされた時点で lazy 起動して以降同一を共有。
+    private var netServer: NetAudioServer?
+    private var netServerError: String?
     // 診断/ status.json は MainActor 非依存の StatusReporter が担う
     // （bare binary / ヘッドレス自動化でも Swift Concurrency main executor
     // 枯渇の影響を受けず、pump と同じく確実に動く）。
@@ -59,6 +63,14 @@ final class RouterController: ObservableObject {
         refreshLists()
         load()
         for r in rows where r.enabled {
+            // 録音は起動時に自動開始しない（不意の録音＝プライバシ/
+            // ディスク浪費を防ぐ）。明示的にトグル ON した時だけ開始。
+            if r.sink == .recorder {
+                if let i = rows.firstIndex(where: { $0.id == r.id }) {
+                    rows[i].enabled = false
+                }
+                continue
+            }
             if !activate(r.id),
                let i = rows.firstIndex(where: { $0.id == r.id }) {
                 rows[i].enabled = false
@@ -66,6 +78,11 @@ final class RouterController: ObservableObject {
         }
         save()
         lastRoutesMTime = routesMTime()
+
+        // NetAudioServer は **常時起動**（行に依存しない）。Bonjour 公開を
+        // 起動時から開始し、Android が HELLO を打ったタイミングで auto-add
+        // できるようにするため。失敗時は netServerError に残るだけで先へ進む。
+        _ = ensureNetServer()
 
         // UI(@Published)は best-effort で GCD main 経由更新（headless では
         // 単に未更新になるだけで status.json には影響しない）。
@@ -159,6 +176,13 @@ final class RouterController: ObservableObject {
         statusByRow[id] = nil; save(); rebuildRefs()
     }
 
+    // 並び替え（List.onMove の (IndexSet, Int) シグネチャに合わせる）。
+    // 行の有効/状態には触れない（save() のみ）— rebuildRefs は順序非依存。
+    func moveRows(from offsets: IndexSet, to destination: Int) {
+        rows.move(fromOffsets: offsets, toOffset: destination)
+        save()
+    }
+
     func setEnabled(_ id: UUID, _ on: Bool) {
         guard let i = rows.firstIndex(where: { $0.id == id }) else { return }
         if on {
@@ -180,6 +204,60 @@ final class RouterController: ObservableObject {
     private func bus(_ name: String) -> AudioBus {
         if let b = buses[name] { return b }
         let b = AudioBus(); buses[name] = b; return b
+    }
+
+    /// NetAudioServer を必要時に 1 度だけ起動。Bonjour で
+    /// `_4noha-audio._udp` を公開し UDP リッスン開始。失敗時は
+    /// netServerError にメッセージを残し nil。
+    /// onSlotPaired コールバックは「Android が HELLO を打って繋がった」
+    /// シグナルなので、対応する行が無ければ自動で 1 つ追加して enable する。
+    private func ensureNetServer() -> NetAudioServer? {
+        if let s = netServer { return s }
+        let s = NetAudioServer(slotCount: 4)
+        s.onSlotPaired = { [weak self] slot, _ in
+            // listenerQ から呼ばれる。MainActor へ hop。
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handleWirelessMicPaired(slot: slot) }
+            }
+        }
+        do {
+            try s.start()
+            netServer = s
+            netServerError = nil
+            return s
+        } catch {
+            netServerError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// 「Android が slot N に HELLO した」ときに呼ばれる。すでに同 slot の
+    /// ワイヤレスマイク行があれば何もしない（既存行が稼働中ならそのまま、
+    /// 停止中なら enable）。無ければ自動で 1 行追加して enable する。
+    /// 追加する行は source=wirelessMic、sink=nil、bus="wifimic\(slot)"。
+    /// 後段は user が手動で繋ぐ前提（splitter / babigoeIn / recorder 等）。
+    private func handleWirelessMicPaired(slot: Int) {
+        if let i = rows.firstIndex(where: {
+            $0.source == .wirelessMic && $0.wirelessSlot == slot
+        }) {
+            if !rows[i].enabled { setEnabled(rows[i].id, true) }
+            return
+        }
+        var r = RouteRow()
+        r.bus = "wifimic\(slot)"
+        r.source = .wirelessMic
+        r.wirelessSlot = slot
+        r.sink = nil
+        r.enabled = false
+        rows.append(r); save(); rebuildRefs()
+        setEnabled(r.id, true)
+    }
+
+    /// 診断 UI 用: ネットサーバが起動しているか、起動エラー、待受ポート。
+    var netServerBoundPort: UInt16 { netServer?.boundPort ?? 0 }
+    var netServerErrorMessage: String? { netServerError }
+    func netServerSlotDiag(slot: Int) -> NetAudioServer.SlotDiag? {
+        return netServer?.diag(slot: slot)
     }
 
     // MARK: activate（source なら IN、sink なら OUT を同一 bus で）
@@ -214,19 +292,41 @@ final class RouterController: ObservableObject {
                     inE = try MicInEdge(deviceID: dev,
                                         useDefault: r.micUID.isEmpty, bus: b)
                 case .babigoeOut:
-                    let s = ShmInEdge(shmName: ShmReader.nameBabigoeOut, bus: b)
+                    let s = ShmInEdge(shmName: ShmReader.babigoeOutName(slot: r.babigoeSlot), bus: b)
+                    s.start(); inE = s
+                case .wirelessMic:
+                    guard let server = ensureNetServer() else {
+                        statusByRow[id] = "ワイヤレスマイク受信開始失敗"
+                            + (netServerError.map { ": \($0)" } ?? "")
+                        return false
+                    }
+                    let s = WirelessMicInEdge(server: server, slot: r.wirelessSlot, bus: b)
                     s.start(); inE = s
                 }
             }
             switch r.sink {
             case .splitter:
-                let s = ShmOutEdge(shmName: ShmSender.nameToSplitter, bus: b)
+                let s = ShmOutEdge(shmName: ShmSender.splitterName(slot: r.splitterSlot), bus: b)
                 s.start(); outE = s
             case .babigoeIn:
-                let s = ShmOutEdge(shmName: ShmSender.nameBabigoeIn, bus: b)
+                let s = ShmOutEdge(shmName: ShmSender.babigoeInName(slot: r.babigoeSlot), bus: b)
+                s.start(); outE = s
+            case .obs:
+                let s = ShmOutEdge(
+                    shmName: ShmSender.obsName(kind: r.obsKind.rawValue, slot: r.obsSlot),
+                    bus: b)
                 s.start(); outE = s
             case .recorder:
                 let s = RecorderOutEdge(bus: b)
+                s.start(); outE = s
+            case .netSpeaker:
+                guard let server = ensureNetServer() else {
+                    inE?.stop()
+                    statusByRow[id] = "ネットスピーカー開始失敗"
+                        + (netServerError.map { ": \($0)" } ?? "")
+                    return false
+                }
+                let s = try NetSpeakerOutEdge(server: server, bus: b)
                 s.start(); outE = s
             case .none:
                 break

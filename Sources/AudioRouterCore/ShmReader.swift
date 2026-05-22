@@ -9,12 +9,25 @@ import CShmCompat
 public final class ShmReader: @unchecked Sendable {
     public static let nameBabigoeOut = "/babigoe.out3"
 
+    /// babigoe 出力チャンネル名。slot=1 はレガシー `/babigoe.out3` (grandfather)、
+    /// slot>=2 は §3.2 新文法 `/babigoe-out.g1.m48.<n>` (n = slot-1)。
+    /// arps-shm-spec.md §5.1 台帳に対応。slot 2 = VST デッキ用 (babigoe-kai 側で書込)。
+    /// 旧 `/babigoe.out3.2` (§3.3 暫定) からの移行先。
+    public static func babigoeOutName(slot: Int) -> String {
+        let s = max(1, min(4, slot))
+        if s == 1 { return nameBabigoeOut }
+        return "/babigoe-out.g1.m48.\(s - 1)"
+    }
+
     private let name: String
     private static let magic: Int32 = 0x5350_5241   // "ARPS" LE
     private static let version: Int32 = 1
-    private static let capacity = 96_000
-    private static let headerBytes = 64
-    private static let totalBytes = headerBytes + capacity * 4
+
+    // 音質プロファイル (§3.4)。既定 = m48 で従来挙動と byte 互換。
+    private let profile: ShmProfile
+    private var capacity: Int { profile.capacity }
+    private var totalBytes: Int { profile.totalBytes }
+    /// 既存呼び出し側互換 (m48 の SR)。多プロファイル化後は profile.sampleRate を参照。
     public static let rate: Int32 = 48_000
 
     private static let offMagic = 0, offVersion = 4, offRate = 8,
@@ -30,8 +43,10 @@ public final class ShmReader: @unchecked Sendable {
 
     public var isRunning: Bool { running }
 
-    public init(name: String = ShmReader.nameBabigoeOut) {
+    public init(name: String = ShmReader.nameBabigoeOut,
+                profile: ShmProfile = .m48) {
         self.name = name.isEmpty ? Self.nameBabigoeOut : name
+        self.profile = profile
     }
 
     /// 共有領域を作成・初期化（所有者）。失敗時 false。
@@ -45,18 +60,18 @@ public final class ShmReader: @unchecked Sendable {
         if f < 0 {
             f = name.withCString { cshm_open_create($0) } // O_CREAT mode0666
             if f < 0 { return false }
-            _ = ftruncate(f, off_t(Self.totalBytes))      // 新規のみ
+            _ = ftruncate(f, off_t(totalBytes))      // 新規のみ
         }
-        let p = mmap(nil, Self.totalBytes,
+        let p = mmap(nil, totalBytes,
                      PROT_READ | PROT_WRITE, MAP_SHARED, f, 0)
         if p == nil || p == Self.mapFailed { close(f); return false }
         fd = f
         base = p
 
         storeI32(p!, Self.offVersion, Self.version)
-        storeI32(p!, Self.offRate, Self.rate)
-        storeI32(p!, Self.offChannels, 1)
-        storeI32(p!, Self.offCapacity, Int32(Self.capacity))
+        storeI32(p!, Self.offRate, profile.sampleRate)
+        storeI32(p!, Self.offChannels, profile.channels)
+        storeI32(p!, Self.offCapacity, Int32(capacity))
         storeI64(p!, Self.offWrite, 0)
         storeI64(p!, Self.offRead, 0)
         storeI32(p!, Self.offMagic, Self.magic)
@@ -70,7 +85,7 @@ public final class ShmReader: @unchecked Sendable {
         running = false
         if let b = base {
             storeI32(b, Self.offReady, 0)
-            munmap(b, Self.totalBytes)
+            munmap(b, totalBytes)
             base = nil
         }
         if fd >= 0 { close(fd); fd = -1 }
@@ -89,7 +104,7 @@ public final class ShmReader: @unchecked Sendable {
             if let p = dst.baseAddress { p.update(repeating: 0, count: n) }
             return 0
         }
-        let cap = Self.capacity
+        let cap = capacity
         OSMemoryBarrier()
         let w = loadI64(base, Self.offWrite)
         var r = loadI64(base, Self.offRead)
@@ -98,7 +113,7 @@ public final class ShmReader: @unchecked Sendable {
         if avail > Int64(cap) { r = w - Int64(cap); avail = Int64(cap) }
 
         let take = Int(min(avail, Int64(n)))
-        let ring = base.advanced(by: Self.headerBytes)
+        let ring = base.advanced(by: ShmProfile.headerBytes)
         if take > 0, let outp = dst.baseAddress {
             let start = Int(r % Int64(cap))
             if start + take <= cap {

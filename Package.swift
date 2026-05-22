@@ -14,9 +14,20 @@ let package = Package(
         .target(
             name: "CShmCompat"
         ),
+        // Homebrew インストールの libopus を Swift から使う systemLibrary。
+        // 開発機に `brew install opus pkg-config` が必要（pkgConfig "opus"
+        // が opus.pc を見つけて自動で -I / -L / -lopus を解決）。.app には
+        // libopus.dylib への動的リンクが残るので、配布する場合は別途
+        // libopus を同梱するか static link 化する必要がある（個人利用の
+        // 範囲では brew パスに依存して問題ない）。
+        .systemLibrary(
+            name: "COpus",
+            pkgConfig: "opus",
+            providers: [.brew(["opus"])]
+        ),
         .target(
             name: "AudioRouterCore",
-            dependencies: ["CShmCompat"]
+            dependencies: ["CShmCompat", "COpus"]
         ),
         .executableTarget(
             name: "AudioRouterApp",

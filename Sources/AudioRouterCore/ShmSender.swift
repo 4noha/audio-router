@@ -14,15 +14,47 @@ import CShmCompat
 ///   受信側 4ksplitter が所有・初期化・破棄。本 writer は attach のみ（O_CREAT
 ///   しない）、不健全時は 1s ゲートで再接続。
 public final class ShmSender: @unchecked Sendable {
-    public static let nameToSplitter = "/4ksp.voice3"  // 4ksplitter 受信
+    public static let nameToSplitter = "/4ksp.voice3"  // 4ksplitter 受信(枠1=レガシー)
     public static let nameBabigoeIn  = "/babigoe.in3"  // babigoe へ mic 供給
+    public static let nameObsMicBase   = "/obs.mic3"   // OBS マイク受信(枠1=接尾辞無し)
+    public static let nameObsVideoBase = "/obs.video3" // OBS 映像音受信(枠1=接尾辞無し)
+
+    /// 4ksplitter のモデル枠(1..4)→shm 名。枠1 はレガシー名据置で
+    /// 既存ルートと完全後方互換。枠2..4 は同契約(ARPS v1/mono48k)別 shm。
+    public static func splitterName(slot: Int) -> String {
+        let s = max(1, min(4, slot))
+        return s == 1 ? nameToSplitter : "\(nameToSplitter).\(s)"
+    }
+
+    /// OBS 受信スロット名。kind="mic"(1..4) / "video"(1..2)。同契約(ARPS v1
+    /// /mono48k)、枠1 は接尾辞無し（splitter と同じ文法）。
+    public static func obsName(kind: String, slot: Int) -> String {
+        let base = kind == "video" ? nameObsVideoBase : nameObsMicBase
+        let maxSlot = kind == "video" ? 2 : 4
+        let s = max(1, min(maxSlot, slot))
+        return s == 1 ? base : "\(base).\(s)"
+    }
+
+    /// babigoe 入力チャンネル名。slot=1 はレガシー `/babigoe.in3` (grandfather)、
+    /// slot>=2 は §3.2 新文法 `/babigoe-in.g1.m48.<n>` (n = slot-1)。
+    /// arps-shm-spec.md §5.1 台帳に対応。slot 2 = VST デッキ用 (babigoe-kai 側で attach)。
+    /// 旧 `/babigoe.in3.2` (§3.3 暫定) からの移行先。
+    public static func babigoeInName(slot: Int) -> String {
+        let s = max(1, min(4, slot))
+        if s == 1 { return nameBabigoeIn }
+        return "/babigoe-in.g1.m48.\(s - 1)"
+    }
     private let name: String
     private static let magic: Int32 = 0x5350_5241   // "ARPS" LE
     private static let version: Int32 = 1
-    private static let capacity = 96_000            // frames (2s @ 48k)
-    private static let headerBytes = 64
-    private static let totalBytes = headerBytes + capacity * 4
-    private static let outRate: Double = 48_000
+
+    // 音質プロファイル (§3.4)。既定 = m48 で従来挙動と byte 互換。
+    // 他プロファイルは送信は mono 経路のため m44/m96 までは設定可能。
+    // ステレオは Send/resample がまだ mono 前提のため要件出るまで非対応。
+    private let profile: ShmProfile
+    private var capacity: Int { profile.capacity }
+    private var totalBytes: Int { profile.totalBytes }
+    private var outRate: Double { Double(profile.sampleRate) }
 
     // ヘッダオフセット
     private static let offMagic = 0, offVersion = 4, offRate = 8,
@@ -79,10 +111,14 @@ public final class ShmSender: @unchecked Sendable {
     private var prevLast: Float = 0
     private var out = [Float](repeating: 0, count: 4096)
 
-    public init(srcSampleRate: Double, name: String = ShmSender.nameToSplitter) {
+    public init(srcSampleRate: Double,
+                name: String = ShmSender.nameToSplitter,
+                profile: ShmProfile = .m48) {
+        self.profile = profile
         self.name = name.isEmpty ? Self.nameToSplitter : name
-        self.srcRate = srcSampleRate > 0 ? srcSampleRate : Self.outRate
-        self.step = self.srcRate / Self.outRate
+        let outR = Double(profile.sampleRate)
+        self.srcRate = srcSampleRate > 0 ? srcSampleRate : outR
+        self.step = self.srcRate / outR
     }
 
     /// データ到来前でも shm を作成・初期化して所有しておく（受信側が
@@ -105,10 +141,10 @@ public final class ShmSender: @unchecked Sendable {
         let outN = resample(samples, n)
         if outN <= 0 { return }
 
-        let cap = Self.capacity
+        let cap = capacity
         let w = loadI64(base, Self.offWrite)
         let start = Int(w % Int64(cap))
-        let ring = base.advanced(by: Self.headerBytes)
+        let ring = base.advanced(by: ShmProfile.headerBytes)
 
         out.withUnsafeBytes { raw in
             let src = raw.baseAddress!
@@ -173,10 +209,10 @@ public final class ShmSender: @unchecked Sendable {
                 dlock.lock(); _lastErrno = errno; dlock.unlock()
                 return false
             }
-            _ = ftruncate(f, off_t(Self.totalBytes))
+            _ = ftruncate(f, off_t(totalBytes))
             freshlyCreated = true
         }
-        let p = mmap(nil, Self.totalBytes,
+        let p = mmap(nil, totalBytes,
                      PROT_READ | PROT_WRITE, MAP_SHARED, f, 0)
         if p == nil || p == Self.mapFailed { close(f); return false }
         fd = f
@@ -185,9 +221,9 @@ public final class ShmSender: @unchecked Sendable {
         // 新規 or 未初期化(magic 不一致)ならヘッダ初期化（最後に ready=1）。
         if freshlyCreated || loadI32(p!, Self.offMagic) != Self.magic {
             storeI32(p!, Self.offVersion, Self.version)
-            storeI32(p!, Self.offRate, Int32(Self.outRate))
-            storeI32(p!, Self.offChannels, 1)
-            storeI32(p!, Self.offCapacity, Int32(Self.capacity))
+            storeI32(p!, Self.offRate, profile.sampleRate)
+            storeI32(p!, Self.offChannels, profile.channels)
+            storeI32(p!, Self.offCapacity, Int32(capacity))
             storeI64(p!, Self.offWrite, 0)
             storeI64(p!, Self.offRead, 0)
             storeI32(p!, Self.offMagic, Self.magic)
@@ -200,7 +236,7 @@ public final class ShmSender: @unchecked Sendable {
     }
 
     private func detach() {
-        if let b = base { munmap(b, Self.totalBytes); base = nil }
+        if let b = base { munmap(b, totalBytes); base = nil }
         if fd >= 0 { close(fd); fd = -1 }
         connected = false
         dlock.lock(); _connDiag = false; dlock.unlock()
