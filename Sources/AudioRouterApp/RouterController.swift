@@ -13,6 +13,7 @@ final class RouterController: ObservableObject {
     @Published var rows: [RouteRow] = []
     @Published var processes: [AudioProcess] = []
     @Published var inputs: [InputDevice] = []
+    @Published var outputs: [OutputDevice] = []
     @Published var statusByRow: [UUID: String] = [:]
     /// 行ごとの流量（♻ 回転判定）。in/out 個別。
     @Published var flowByRow: [UUID: RowFlow] = [:]
@@ -137,6 +138,7 @@ final class RouterController: ObservableObject {
     func refreshLists() {
         processes = ProcessEnumerator.list(onlyOutput: true)
         inputs = AudioDeviceEnumerator.inputs()
+        outputs = AudioDeviceEnumerator.outputs()
     }
 
     func active(_ id: UUID) -> Bool {
@@ -156,6 +158,19 @@ final class RouterController: ObservableObject {
     }
 
     var busNames: [String] { Array(Set(rows.map { $0.bus })).sorted() }
+
+    /// speaker sink の行のゲインをライブ更新 (アクティブなら edge へ反映)、
+    /// 同時に row に保存して永続化。再起動不要。
+    func setSpeakerGain(_ id: UUID, _ gain: Float) {
+        let g = max(0, min(1, gain))
+        if let i = rows.firstIndex(where: { $0.id == id }) {
+            rows[i].speakerGain = g
+            save()
+        }
+        if let e = engines[id]?.outE as? SpeakerOutEdge {
+            e.setGain(g)
+        }
+    }
 
     // MARK: CRUD
 
@@ -214,10 +229,12 @@ final class RouterController: ObservableObject {
     private func ensureNetServer() -> NetAudioServer? {
         if let s = netServer { return s }
         let s = NetAudioServer(slotCount: 4)
-        s.onSlotPaired = { [weak self] slot, _ in
+        s.onSlotPaired = { [weak self] slot, _, name in
             // listenerQ から呼ばれる。MainActor へ hop。
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.handleWirelessMicPaired(slot: slot) }
+                MainActor.assumeIsolated {
+                    self?.handleWirelessMicPaired(slot: slot, name: name)
+                }
             }
         }
         do {
@@ -231,26 +248,61 @@ final class RouterController: ObservableObject {
         }
     }
 
-    /// 「Android が slot N に HELLO した」ときに呼ばれる。すでに同 slot の
-    /// ワイヤレスマイク行があれば何もしない（既存行が稼働中ならそのまま、
-    /// 停止中なら enable）。無ければ自動で 1 行追加して enable する。
-    /// 追加する行は source=wirelessMic、sink=nil、bus="wifimic\(slot)"。
-    /// 後段は user が手動で繋ぐ前提（splitter / babigoeIn / recorder 等）。
-    private func handleWirelessMicPaired(slot: Int) {
+    /// 「Android/iOS が HELLO を撃ってきた」ときに呼ばれる。**端末名が行の
+    /// identity**:
+    ///   - 同名の行があれば slot 更新 + 有効化（停止中ならON）
+    ///   - **名前が違えば必ず新規行を追加**（端末ごとに独立した行・設定）
+    ///   - 名前未設定の orphan 行（slot 一致 + name 空）は救済として付け替え可
+    /// 追加する行は source=wirelessMic、sink=nil、bus はサニタイズした端末名。
+    private func handleWirelessMicPaired(slot: Int, name: String) {
+        // 同名行を最優先で探す
         if let i = rows.firstIndex(where: {
-            $0.source == .wirelessMic && $0.wirelessSlot == slot
+            $0.source == .wirelessMic && $0.wirelessDeviceName == name
         }) {
+            var changed = false
+            if rows[i].wirelessSlot != slot { rows[i].wirelessSlot = slot; changed = true }
+            if changed { save(); rebuildRefs() }
             if !rows[i].enabled { setEnabled(rows[i].id, true) }
             return
         }
+        // 名前**未設定**（旧バージョン由来の orphan）かつ同 slot の行のみ
+        // 名前を補完。名前が既に入っている行は他端末のものなので**触らない**。
+        if let i = rows.firstIndex(where: {
+            $0.source == .wirelessMic
+                && $0.wirelessSlot == slot
+                && $0.wirelessDeviceName.isEmpty
+        }) {
+            rows[i].wirelessDeviceName = name
+            save(); rebuildRefs()
+            if !rows[i].enabled { setEnabled(rows[i].id, true) }
+            return
+        }
+        // 新規追加（端末ごとに独立した行）
         var r = RouteRow()
-        r.bus = "wifimic\(slot)"
+        r.bus = "wifimic-\(sanitizeBusName(name))"
         r.source = .wirelessMic
         r.wirelessSlot = slot
+        r.wirelessDeviceName = name
         r.sink = nil
         r.enabled = false
         rows.append(r); save(); rebuildRefs()
         setEnabled(r.id, true)
+    }
+
+    /// bus 名は ASCII 限定にしたいので、非英数を `_` に置換。重複は許容
+    /// （fan-out 既定動作）。
+    private func sanitizeBusName(_ s: String) -> String {
+        let asciiAlnum = CharacterSet.alphanumerics.subtracting(
+            CharacterSet(charactersIn: "\u{0080}\u{0081}"))
+        var out = ""
+        for c in s.unicodeScalars {
+            if asciiAlnum.contains(c) && c.value < 128 {
+                out.append(Character(c))
+            } else if !out.hasSuffix("_") {
+                out.append("_")
+            }
+        }
+        return out.isEmpty ? "unknown" : out
     }
 
     /// 診断 UI 用: ネットサーバが起動しているか、起動エラー、待受ポート。
@@ -326,7 +378,25 @@ final class RouterController: ObservableObject {
                         + (netServerError.map { ": \($0)" } ?? "")
                     return false
                 }
-                let s = try NetSpeakerOutEdge(server: server, bus: b)
+                let target = r.wirelessTargetSlot == 0 ? nil
+                    : r.wirelessTargetSlot
+                let s = try NetSpeakerOutEdge(server: server, bus: b,
+                                              targetSlot: target)
+                s.start(); outE = s
+            case .speaker:
+                // 指定 UID 優先、なければ既定出力。
+                let dev = r.speakerUID.isEmpty
+                    ? AudioDeviceEnumerator.defaultOutput()
+                    : outputs.first(where: { $0.uid == r.speakerUID })
+                        ?? AudioDeviceEnumerator.defaultOutput()
+                guard let dev else {
+                    inE?.stop()
+                    statusByRow[id] = "出力デバイスが見つかりません"
+                    return false
+                }
+                let s = SpeakerOutEdge(deviceID: dev.id,
+                                        deviceName: dev.name, bus: b,
+                                        gain: r.speakerGain)
                 s.start(); outE = s
             case .none:
                 break

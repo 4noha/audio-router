@@ -20,10 +20,21 @@ public final class AudioMonitor: @unchecked Sendable {
     private var readIdx = 0
     private var filled = 0
 
-    public init(deviceID: AudioObjectID, sampleRate: Double, capacitySeconds: Double = 0.5) {
+    // プロデューサ(SpeakerOutEdge.enqueue)は 26ms 周期で 1248 サンプル単位の
+    // burst supply (babigoe の DSP ブロックが /babigoe.out3 へ吐かれるリズム)。
+    // 一方デバイス render は連続 (sampleRate fps)。pre-buffer 無しで再生開始すると
+    // burst 間隙で ring が 0 近くまで降下し、render が部分ゼロ埋め=クリックになる。
+    // 蓄積するまで再生せず無音返しすることで起動時の cold buffer をマージン化。
+    private var primed = false
+    private let primeFrames: Int
+
+    public init(deviceID: AudioObjectID, sampleRate: Double,
+                capacitySeconds: Double = 0.5,
+                primeMs: Double = 50) {
         self.deviceID = deviceID
         self.sampleRate = sampleRate
         self.ring = [Float](repeating: 0, count: max(1, Int(sampleRate * capacitySeconds)))
+        self.primeFrames = max(1, Int(sampleRate * primeMs / 1000.0))
     }
 
     public func start() throws {
@@ -42,7 +53,22 @@ public final class AudioMonitor: @unchecked Sendable {
             guard let self else { return noErr }
             let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
             let n = Int(frameCount)
+            // pre-fill 未到達なら一律無音返し (readIdx を進めない)。十分蓄積した
+            // 時点で primed=true にしてその後は通常再生。これでバースト供給と
+            // 連続 render の位相差で起きる underrun (=クリック) を抑える。
             self.lock.lock()
+            if !self.primed {
+                if self.filled >= self.primeFrames {
+                    self.primed = true
+                } else {
+                    self.lock.unlock()
+                    for buffer in abl {
+                        guard let ptr = buffer.mData?.bindMemory(to: Float.self, capacity: n) else { continue }
+                        for i in 0..<n { ptr[i] = 0 }
+                    }
+                    return noErr
+                }
+            }
             let avail = min(self.filled, n)
             self.lock.unlock()
             for buffer in abl {
@@ -72,6 +98,10 @@ public final class AudioMonitor: @unchecked Sendable {
         engine.stop()
         if let sourceNode { engine.detach(sourceNode) }
         sourceNode = nil
+        lock.lock()
+        primed = false  // 再 start 時にまた蓄積から
+        filled = 0; readIdx = 0; writeIdx = 0
+        lock.unlock()
     }
 
     public func enqueue(_ samples: UnsafeBufferPointer<Float>) {

@@ -112,7 +112,12 @@ struct WaveStrip: View {
                 let stepX = size.width / CGFloat(n - 3)
                 let off = CGFloat(frac)
                 func pt(_ i: Int, up: Bool) -> CGPoint {
-                    let a = max(0.5, CGFloat(min(max(s[i], 0), 1)) * maxA)
+                    // 線形スケールだと声の典型ピーク (~0.1) が高さ 10% に
+                    // しかならず波形が潰れる。sqrt 圧縮でメーター感の
+                    // 視認性を確保 (0.01→10%, 0.1→32%, 0.5→71%, 1.0→100%)。
+                    let v = min(max(s[i], 0), 1)
+                    let scaled = sqrt(v)
+                    let a = max(0.5, CGFloat(scaled) * maxA)
                     return CGPoint(x: (CGFloat(i) - off) * stepX,
                                    y: up ? midY - a : midY + a)
                 }
@@ -163,7 +168,8 @@ struct RoutingView: View {
                 Button {
                     var r = RouteRow()
                     r.bus = ctl.busNames.first ?? "bus1"
-                    r.source = .appTap; r.sink = .splitter
+                    // ソース/シンクは初期値なし — ユーザに必ず選んでもらう。
+                    r.source = nil; r.sink = nil
                     editing = r; isNew = true
                     ctl.refreshLists(); showEditor = true
                 } label: { Label("ルートを追加", systemImage: "plus.circle.fill") }
@@ -259,6 +265,24 @@ struct RoutingView: View {
                     }
                 }
                 Spacer()
+                if r.sink == .speaker {
+                    // インラインフェーダー: 行ごとに live 音量調整。slider 動きは
+                    // ライブで SpeakerOutEdge へ反映され、同時に routes.json 永続化。
+                    Image(systemName: r.speakerGain == 0 ? "speaker.slash" :
+                                       r.speakerGain < 0.34 ? "speaker.wave.1" :
+                                       r.speakerGain < 0.67 ? "speaker.wave.2"
+                                                            : "speaker.wave.3")
+                        .foregroundStyle(.secondary)
+                    Slider(value: Binding(
+                        get: { Double(r.speakerGain) },
+                        set: { ctl.setSpeakerGain(r.id, Float($0)) }),
+                           in: 0...1)
+                        .frame(width: 90)
+                        .help("出力フェーダー (0 = ミュート、100% = ユニティ)")
+                    Text("\(Int((r.speakerGain * 100).rounded()))%")
+                        .font(.caption).monospacedDigit()
+                        .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
+                }
                 if on && r.sink == .recorder { WaveStrip { ctl.wavePhased(r.id) } }
                 Toggle("", isOn: Binding(
                     get: { ctl.active(r.id) },
@@ -299,6 +323,12 @@ struct RouteEditorView: View {
     @State private var obsSlot: Int = 1        // 1..maxSlot。snk==.obs のときだけ意味を持つ
     @State private var babigoeSlot: Int = 1    // 1..4。snk==.babigoeIn または src==.babigoeOut のときだけ
     @State private var wirelessSlot: Int = 1   // 1..4。src==.wirelessMic のときだけ意味を持つ
+    // snk==.netSpeaker のときの宛先 (0=全端末ブロードキャスト, 1..4=特定 slot)。
+    @State private var wirelessTargetSlot: Int = 0
+    @State private var wirelessTargetName: String = ""
+    @State private var speakerUID: String = "" // snk==.speaker のときの出力デバイス UID
+    @State private var speakerName: String = ""
+    @State private var speakerGain: Float = 1.0  // 0..1
 
     private var canSave: Bool {
         guard src != nil || snk != nil else { return false }
@@ -315,7 +345,7 @@ struct RouteEditorView: View {
                     Picker("ソース", selection: $src) {
                         Text("なし").tag(SourceKind?.none)
                         Text("アプリ").tag(SourceKind?.some(.appTap))
-                        Text("マイク").tag(SourceKind?.some(.mic))
+                        Text("マイク(オーディオ入力デバイス)").tag(SourceKind?.some(.mic))
                         Text("babigoe(出力)").tag(SourceKind?.some(.babigoeOut))
                         Text("ワイヤレスマイク(Android)").tag(SourceKind?.some(.wirelessMic))
                     }
@@ -401,6 +431,7 @@ struct RouteEditorView: View {
                         Text("babigoe(入力)").tag(SinkKind?.some(.babigoeIn))
                         Text("OBS").tag(SinkKind?.some(.obs))
                         Text("ネットスピーカー(Android)").tag(SinkKind?.some(.netSpeaker))
+                        Text("スピーカー(オーディオ出力デバイス)").tag(SinkKind?.some(.speaker))
                         Text("録音(WAV ファイル)").tag(SinkKind?.some(.recorder))
                     }
                     // 4ksplitter のみモデル枠を選択（複数モデル独立リップシンクへの分岐）。
@@ -420,10 +451,67 @@ struct RouteEditorView: View {
                         }
                     }
                     if snk == .netSpeaker {
-                        Text("接続中の全 Android へ Opus(AUDIO mode, 128kbps) で "
-                             + "ブロードキャスト。任意 bus を流せるので音楽・効果音含む "
-                             + "ミックスを Android で聴ける。")
+                        Text("接続中の端末へ Opus(AUDIO mode, 192kbps) で送信。"
+                             + "任意 bus を流せるので音楽・効果音含むミックスを "
+                             + "端末で聴ける。「全端末」でブロードキャスト、"
+                             + "個別端末選択で当該端末のみへ。")
                             .font(.caption).foregroundStyle(.secondary)
+                        // 接続中端末: source==wirelessMic の行で deviceName 付き
+                        // のものから抽出 (既設の wireless 行が一覧の代わり)。
+                        let peers: [(slot: Int, name: String)] = ctl.rows
+                            .compactMap {
+                                guard $0.source == .wirelessMic,
+                                      !$0.wirelessDeviceName.isEmpty else { return nil }
+                                return (slot: $0.wirelessSlot,
+                                        name: $0.wirelessDeviceName)
+                            }
+                            .sorted { $0.slot < $1.slot }
+                        Picker("宛先端末", selection: $wirelessTargetSlot) {
+                            Text("全端末（ブロードキャスト）").tag(0)
+                            // 過去保存の宛先 slot が現行 peers にいなくても表示維持。
+                            if wirelessTargetSlot != 0,
+                               !peers.contains(where: { $0.slot == wirelessTargetSlot }) {
+                                let n = wirelessTargetName.isEmpty
+                                    ? "slot\(wirelessTargetSlot)"
+                                    : wirelessTargetName
+                                Text("\(n)（未接続）").tag(wirelessTargetSlot)
+                            }
+                            ForEach(peers, id: \.slot) { p in
+                                Text("\(p.name) (slot \(p.slot))").tag(p.slot)
+                            }
+                        }
+                        .onChange(of: wirelessTargetSlot) { _, v in
+                            if v == 0 { wirelessTargetName = "" }
+                            else if let p = peers.first(where: { $0.slot == v }) {
+                                wirelessTargetName = p.name
+                            }
+                        }
+                    }
+                    if snk == .speaker {
+                        Picker("出力デバイス", selection: $speakerUID) {
+                            Text("既定の出力").tag("")
+                            if !speakerUID.isEmpty,
+                               !ctl.outputs.contains(where: { $0.uid == speakerUID }) {
+                                Text("\(speakerName)（未接続）").tag(speakerUID)
+                            }
+                            ForEach(ctl.outputs) { d in Text(d.name).tag(d.uid) }
+                        }
+                        .onChange(of: speakerUID) { _, v in
+                            if let d = ctl.outputs.first(where: { $0.uid == v }) {
+                                speakerName = d.name
+                            } else if v.isEmpty {
+                                speakerName = ""
+                            }
+                        }
+                        Text("選んだ出力デバイスで bus の音を再生します（スピーカ/"
+                             + "ヘッドホン/USB DAC 等）。既定出力を選ぶと OS の出力切替に追随。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Text("音量")
+                            Slider(value: $speakerGain, in: 0...1)
+                            Text("\(Int((speakerGain * 100).rounded()))%")
+                                .monospacedDigit().frame(width: 44, alignment: .trailing)
+                        }
                     }
                     // OBS は枠種別(mic/video)＋ 枠番号(mic:1..4 / video:1..2)。
                     // 種別を変えると最大枠数が変わるので slot を切り詰める。
@@ -465,6 +553,11 @@ struct RouteEditorView: View {
                     r.obsSlot = obsSlot
                     r.babigoeSlot = babigoeSlot
                     r.wirelessSlot = wirelessSlot
+                    r.wirelessTargetSlot = wirelessTargetSlot
+                    r.wirelessTargetName = wirelessTargetName
+                    r.speakerUID = speakerUID
+                    r.speakerName = speakerName
+                    r.speakerGain = speakerGain
                     onSave(r); dismiss()
                 }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
@@ -486,6 +579,11 @@ struct RouteEditorView: View {
             obsSlot = original.obsSlot
             babigoeSlot = original.babigoeSlot
             wirelessSlot = original.wirelessSlot
+            wirelessTargetSlot = original.wirelessTargetSlot
+            wirelessTargetName = original.wirelessTargetName
+            speakerUID = original.speakerUID
+            speakerGain = original.speakerGain
+            speakerName = original.speakerName
         }
     }
 }

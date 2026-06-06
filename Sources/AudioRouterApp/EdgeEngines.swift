@@ -161,7 +161,10 @@ final class ShmInEdge: EdgeEngine {
     private let bus: AudioBus
     private var pump: DispatchSourceTimer?
     private let q = DispatchQueue(label: "audio-router.edge.shmin", qos: .userInteractive)
-    private var pull = [Float](repeating: 0, count: 1024)
+    // pull は 4096 に拡大: babigoe が /babigoe.out3 に 26ms 周期で 1248 サンプル
+    // 一気書きするため、従来の 1024 だと 1 tick で読み切れず 2 tick に分かれて
+    // burst が崩れていた。1 tick で 1 ブロックを取り切る。
+    private var pull = [Float](repeating: 0, count: 4096)
     private let lk = NSLock()
     private var got = 0
     private var ok = false
@@ -214,7 +217,10 @@ final class ShmOutEdge: EdgeEngine {
     private let reader: AudioBus.Reader
     private var pump: DispatchSourceTimer?
     private let q = DispatchQueue(label: "audio-router.edge.shmout", qos: .userInteractive)
-    private var pull = [Float](repeating: 0, count: 1024)
+    // pull は 4096 に拡大: babigoe が /babigoe.out3 に 26ms 周期で 1248 サンプル
+    // 一気書きするため、従来の 1024 だと 1 tick で読み切れず 2 tick に分かれて
+    // burst が崩れていた。1 tick で 1 ブロックを取り切る。
+    private var pull = [Float](repeating: 0, count: 4096)
     private let lk = NSLock()
     private var _lvl: Float = 0
     private let wave = PeakRing()
@@ -272,7 +278,10 @@ final class WirelessMicInEdge: EdgeEngine {
     private var pump: DispatchSourceTimer?
     private let q = DispatchQueue(label: "audio-router.edge.wirelessmic",
                                   qos: .userInteractive)
-    private var pull = [Float](repeating: 0, count: 1024)
+    // pull は 4096 に拡大: babigoe が /babigoe.out3 に 26ms 周期で 1248 サンプル
+    // 一気書きするため、従来の 1024 だと 1 tick で読み切れず 2 tick に分かれて
+    // burst が崩れていた。1 tick で 1 ブロックを取り切る。
+    private var pull = [Float](repeating: 0, count: 4096)
     private let lk = NSLock()
     private var got = 0
     private var _lvl: Float = 0
@@ -323,7 +332,8 @@ final class WirelessMicInEdge: EdgeEngine {
         // 上がらない場合は jitter buffer / opus decode が止まっている。
         if let sd = server?.diag(slot: slot) {
             let host = sd.peerHost ?? "-"
-            return "wirelessmic recv=\(g) pkts=\(sd.packetsIn) drop=\(sd.packetsDropped) lost=\(sd.packetsLost) host=\(host)"
+            let ver = sd.appVersion.isEmpty ? "" : " v=\(sd.appVersion)"
+            return "wirelessmic recv=\(g) pkts=\(sd.packetsIn) drop=\(sd.packetsDropped) lost=\(sd.packetsLost) host=\(host)\(ver)"
         }
         return "wirelessmic recv=\(g)"
     }
@@ -340,14 +350,19 @@ final class NetSpeakerOutEdge: EdgeEngine {
     private var pump: DispatchSourceTimer?
     private let q = DispatchQueue(label: "audio-router.edge.netspk.mon",
                                   qos: .utility)
-    private var pull = [Float](repeating: 0, count: 1024)
+    // pull は 4096 に拡大: babigoe が /babigoe.out3 に 26ms 周期で 1248 サンプル
+    // 一気書きするため、従来の 1024 だと 1 tick で読み切れず 2 tick に分かれて
+    // burst が崩れていた。1 tick で 1 ブロックを取り切る。
+    private var pull = [Float](repeating: 0, count: 4096)
     private let lk = NSLock()
     private var _lvl: Float = 0
     private let wave = PeakRing()
     private var sentLast: Int64 = 0
 
-    init(server: NetAudioServer, bus: AudioBus) throws {
-        self.broadcaster = try NetAudioBroadcaster(server: server, bus: bus)
+    init(server: NetAudioServer, bus: AudioBus,
+         targetSlot: Int? = nil) throws {
+        self.broadcaster = try NetAudioBroadcaster(server: server, bus: bus,
+                                                    targetSlot: targetSlot)
         self.monReader = bus.makeReader()
     }
     func start() {
@@ -385,6 +400,87 @@ final class NetSpeakerOutEdge: EdgeEngine {
     var diag: String {
         let s = broadcaster.snapshot()
         return "netspk sent=\(s.sentFrames) bytes=\(s.bytesOut)"
+    }
+}
+
+// MARK: - OUT: bus → スピーカー（任意 macOS 出力デバイスで再生）
+
+/// AudioMonitor を内包し bus から読んだサンプルを enqueue するだけのエッジ。
+/// deviceID は呼出側 (RouterController) が解決して渡す。
+@available(macOS 14.4, *)
+final class SpeakerOutEdge: EdgeEngine {
+    private let monitor: AudioMonitor
+    private let reader: AudioBus.Reader
+    private var pump: DispatchSourceTimer?
+    private let q = DispatchQueue(label: "audio-router.edge.speaker",
+                                  qos: .userInteractive)
+    // pull は 4096 に拡大: babigoe が /babigoe.out3 に 26ms 周期で 1248 サンプル
+    // 一気書きするため、従来の 1024 だと 1 tick で読み切れず 2 tick に分かれて
+    // burst が崩れていた。1 tick で 1 ブロックを取り切る。
+    private var pull = [Float](repeating: 0, count: 4096)
+    private let lk = NSLock()
+    private var _sent = 0
+    private var _lvl: Float = 0
+    private var _gain: Float = 1.0    // 0..1、UI フェーダーから setGain で更新
+    private let wave = PeakRing()
+    private let deviceName: String
+
+    init(deviceID: AudioObjectID, deviceName: String, bus: AudioBus,
+         gain: Float = 1.0) {
+        self.monitor = AudioMonitor(deviceID: deviceID,
+                                    sampleRate: Double(AudioBus.rate))
+        self.reader = bus.makeReader()
+        self.deviceName = deviceName
+        self._gain = max(0, min(1, gain))
+    }
+    /// UI のフェーダーからライブ更新 (再起動不要)。
+    func setGain(_ g: Float) {
+        lk.lock(); _gain = max(0, min(1, g)); lk.unlock()
+    }
+    func start() {
+        try? monitor.start()
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + .milliseconds(5),
+                   repeating: .milliseconds(5), leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            let n = self.pull.withUnsafeMutableBufferPointer {
+                self.reader.read(into: $0)
+            }
+            guard n > 0 else { return }
+            self.lk.lock(); let g = self._gain; self.lk.unlock()
+            if g != 1.0 {
+                if g == 0 {
+                    for i in 0..<n { self.pull[i] = 0 }
+                } else {
+                    for i in 0..<n { self.pull[i] *= g }
+                }
+            }
+            var pk: Float = 0
+            for i in 0..<n { let a = abs(self.pull[i]); if a > pk { pk = a } }
+            self.pull.withUnsafeBufferPointer {
+                self.monitor.enqueue(UnsafeBufferPointer(
+                    start: $0.baseAddress, count: n))
+            }
+            self.wave.push(pk)
+            self.lk.lock()
+            self._sent += n
+            if pk > self._lvl { self._lvl = pk }
+            self.lk.unlock()
+        }
+        t.resume()
+        pump = t
+    }
+    func stop() { pump?.cancel(); pump = nil; monitor.stop() }
+    var frames: Int { lk.lock(); defer { lk.unlock() }; return _sent }
+    var level: Float {
+        lk.lock(); defer { lk.unlock() }; let v = _lvl; _lvl = 0; return v
+    }
+    var waveform: [Float] { wave.snapshot() }
+    var waveFrac: Float { Float(wave.phase) }
+    var diag: String {
+        lk.lock(); let n = _sent; lk.unlock()
+        return "speaker→\(deviceName) \(n)f"
     }
 }
 

@@ -32,6 +32,7 @@ enum SinkKind: String, Codable, Hashable, CaseIterable {
     case recorder     // ファイルへ録音(WAV)
     case obs          // OBS(obs-audio-router-shm)へ /obs.mic*/.video*
     case netSpeaker   // 接続中の全 Android アプリへ Opus で送る (戻し)
+    case speaker      // 任意 macOS 出力デバイスで再生 (スピーカー/ヘッドホン)
 
     var label: String {
         switch self {
@@ -40,6 +41,7 @@ enum SinkKind: String, Codable, Hashable, CaseIterable {
         case .recorder:    return "録音"
         case .obs:         return "OBS"
         case .netSpeaker:  return "ネットスピーカー"
+        case .speaker:     return "スピーカー"
         }
     }
 }
@@ -90,9 +92,23 @@ struct RouteRow: Identifiable, Codable, Hashable {
     // mic は 1..4、video は 1..2（ObsKind.maxSlot に従う）。
     var obsKind: ObsKind = .mic
     var obsSlot: Int = 1
-    // ワイヤレスマイク slot 番号 (1..4)。source == .wirelessMic のときだけ意味を持つ。
-    // netSpeaker sink は全 slot ブロードキャストなので参照しない。
+    // ワイヤレスマイク slot 番号 (1..4)。NetAudioServer が端末名から
+    // 動的割当した値。Mac 再起動で再割当される（端末名で同じ slot を再現）。
     var wirelessSlot: Int = 1
+    // ワイヤレスマイク Android 端末名 (HELLO payload 由来)。
+    // **行の identity は端末名**で、slot は副次。表示に使う。
+    var wirelessDeviceName: String = ""
+    // netSpeaker sink の宛先 slot。0 = 接続中の全端末へブロードキャスト、
+    // 1..4 = その slot のみ。sink == .netSpeaker のときだけ意味を持つ。
+    var wirelessTargetSlot: Int = 0
+    // sink == .netSpeaker かつ wirelessTargetSlot != 0 のときに UI で
+    // 表示する宛先端末名 (再起動後 slot 再割当に強くなるよう保持)。
+    var wirelessTargetName: String = ""
+    // speaker sink で再生する出力デバイス。空 = 既定出力。
+    var speakerUID: String = ""
+    var speakerName: String = ""
+    // speaker sink 用フェーダー (0..1 線形)。1.0 = unity、0.0 = ミュート。
+    var speakerGain: Float = 1.0
     // babigoe 行きの枠 (1..4)。1 = レガシー /babigoe.in3 と /babigoe.out3、
     // 2..4 = .<n> 接尾辞。babigoe-kai 側の元バ美声=1、VST デッキ=2 想定。
     // sink == .babigoeIn または source == .babigoeOut のときだけ意味を持つ。
@@ -108,6 +124,9 @@ struct RouteRow: Identifiable, Codable, Hashable {
         case appBundleID, appName, muteSource
         case micUID, micName
         case enabled, splitterSlot, obsKind, obsSlot, babigoeSlot, wirelessSlot
+        case wirelessDeviceName
+        case wirelessTargetSlot, wirelessTargetName
+        case speakerUID, speakerName, speakerGain
     }
     init() {}
     init(from decoder: Decoder) throws {
@@ -135,6 +154,19 @@ struct RouteRow: Identifiable, Codable, Hashable {
         wirelessSlot = (try c.decodeIfPresent(Int.self, forKey: .wirelessSlot)) ?? 1
         if wirelessSlot < 1 { wirelessSlot = 1 }
         if wirelessSlot > 4 { wirelessSlot = 4 }
+        wirelessDeviceName = (try c.decodeIfPresent(String.self,
+            forKey: .wirelessDeviceName)) ?? ""
+        wirelessTargetSlot = (try c.decodeIfPresent(Int.self,
+            forKey: .wirelessTargetSlot)) ?? 0
+        if wirelessTargetSlot < 0 { wirelessTargetSlot = 0 }
+        if wirelessTargetSlot > 4 { wirelessTargetSlot = 0 }
+        wirelessTargetName = (try c.decodeIfPresent(String.self,
+            forKey: .wirelessTargetName)) ?? ""
+        speakerUID = (try c.decodeIfPresent(String.self, forKey: .speakerUID)) ?? ""
+        speakerName = (try c.decodeIfPresent(String.self, forKey: .speakerName)) ?? ""
+        speakerGain = (try c.decodeIfPresent(Float.self, forKey: .speakerGain)) ?? 1.0
+        if speakerGain < 0 { speakerGain = 0 }
+        if speakerGain > 1 { speakerGain = 1 }
     }
 
     /// IN ソース表示名（nil = ソース無し）。
@@ -143,7 +175,10 @@ struct RouteRow: Identifiable, Codable, Hashable {
         case .appTap:     return appName.isEmpty ? "（アプリ未選択）" : appName
         case .mic:        return micName.isEmpty ? "既定マイク" : micName
         case .babigoeOut: return babigoeSlot > 1 ? "babigoe#\(babigoeSlot)" : "babigoe"
-        case .wirelessMic: return wirelessSlot > 1 ? "ワイヤレスマイク#\(wirelessSlot)" : "ワイヤレスマイク"
+        case .wirelessMic:
+            // 行の identity は端末名そのもの（簡潔表示）。名前未取得時のみ
+            // ワイヤレスマイクラベルを出す。
+            return wirelessDeviceName.isEmpty ? "ワイヤレスマイク" : wirelessDeviceName
         case .none:       return nil
         }
     }
@@ -156,6 +191,16 @@ struct RouteRow: Identifiable, Codable, Hashable {
         if s == .obs {
             let suffix = obsSlot > 1 ? "#\(obsSlot)" : ""
             return "\(s.label) \(obsKind.label)\(suffix)"
+        }
+        if s == .speaker {
+            let n = speakerName.isEmpty ? "既定出力" : speakerName
+            return "\(s.label) (\(n))"
+        }
+        if s == .netSpeaker {
+            if wirelessTargetSlot == 0 { return "\(s.label) (全端末)" }
+            let n = wirelessTargetName.isEmpty ? "slot\(wirelessTargetSlot)"
+                                               : wirelessTargetName
+            return "\(s.label) (\(n))"
         }
         return s.label
     }
