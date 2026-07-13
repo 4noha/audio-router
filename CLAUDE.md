@@ -65,7 +65,15 @@ scripts/e2e/run.sh --build
 - ARPS v1 共有メモリ契約（受信側 = C# / 送信側 = Swift で **byte 一致**必須）:
   - 名前: macOS POSIX shm 名上限 31 文字。`/4ksp.voice3`(枠1 レガシー),
     `/4ksp.voice3.<2..4>`(枠2..4), `/babigoe.in3`(audio-router → babigoe),
-    `/babigoe.out3`(babigoe → audio-router)
+    `/babigoe.out3`(babigoe → audio-router), `/babigoe-in.g1.m48.1` /
+    `-out.g1.m48.1`(VST デッキ), `/obs.mic3`(.2..4) / `/obs.video3`(.2)
+    (audio-router → OBS ほか)。台帳の権威は `docs/arps-shm-spec.md` §5
+  - **1 shm = 1 consumer**(readIndex は単一カーソル)。読み手を増やすときは
+    同じ bus を別 sink 行へ fan-out して枠を分ける。ライブ字幕
+    (yt-translator `serve_engine.py --arps`, 起動は `scripts/yt_subtitles.sh`)
+    は `/obs.mic3.2` に attach する運用。供給は本アプリの fan-out 行か
+    OBS「AudioRouter SHM Output」フィルタ(OBS 内ソース指定)の**どちらか
+    片方**(1 枠 1 書き手、二重書込禁止)
   - ヘッダ 64B: `magic="ARPS"LE(0x53505241)` / `version=1` /
     `sampleRate=48000` / `channels=1` / `capacity=96000` / `ready` /
     `consumerPid` / `writeIndex` / `readIndex`

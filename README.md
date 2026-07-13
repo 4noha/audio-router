@@ -36,21 +36,40 @@ SOURCE                        BUS (named, mono f32 48k)             SINK
 | source | `appTap`      | 指定アプリの出力を Process Tap API で捕捉 |
 | source | `mic`         | 入力デバイス（既定 or UID 指定） |
 | source | `babigoeOut`  | `/babigoe.out3` を attach（babigoe 処理済を回収） |
+| source | `wirelessMic` | iOS/Android コンパニオンから UDP(Opus) で届くマイク音 (slot 1..4) |
 | sink   | `splitter`    | `/4ksp.voice3`(枠1) / `/4ksp.voice3.<2..4>` へ送出（4ksplitter リップシンク） |
 | sink   | `babigoeIn`   | `/babigoe.in3` へ送出（babigoe へマイク供給） |
+| sink   | `obs`         | `/obs.mic3`(.2..4) / `/obs.video3`(.2) へ送出（OBS「AudioRouter SHM Input」/ ライブ字幕 yt-translator） |
+| sink   | `netSpeaker`  | 接続中のコンパニオン端末へ Opus で戻し再生 |
+| sink   | `speaker`     | 任意 macOS 出力デバイスで再生（フェーダー付き） |
 | sink   | `recorder`    | `~/Music/AudioRouter/rec-<ts>.wav`（PCM16 mono 48k） |
+
+ライブ字幕: 最も簡単なのは **obs-hatsuri-subtitles の内蔵エンジンモード**
+（OBS の「Hatsuri Subtitles」ソースのプロパティでオーディオソースを指定
+するだけ。shm 配線・ターミナル不要）。shm 経由の代替経路として
+`scripts/yt_subtitles.sh` が yt-translator の `serve_engine.py --arps` を
+起動し `/obs.mic3.2` を読む構成も使える。その場合の `/obs.mic3.2` への
+供給は**どちらか片方**（1 枠 1 書き手）:
+
+1. 本アプリの fan-out 行（マイクの bus → sink「OBS マイク#2」）
+2. OBS 内の任意ソース（例:「AudioRouter SHM Input」）に
+   「AudioRouter SHM Output」フィルタを付け、preset「OBS マイク#2」+
+   allow_create ON — **字幕対象を OBS 側で指定**する運用
 
 `recorder` は安全側設計として **起動時に自動開始しない**（明示トグル ON
 のみ録音、不意の録音とディスク浪費を防止）。
 
 ## ARPS v1 共有メモリ契約（外部 repo との byte 一致仕様）
 
-audio-router / 4ksplitter / babigoe-kai の 3 repo で **byte 一致**して
-いる固定契約。本リポは「**全 shm の作成・所有を一手に担う**」側で、
-C# 受信側は attach 専用。
+配信側 5 repo（audio-router / 4ksplitter / babigoe-kai / pan-pan /
+obs-plugins/obs-audio-router-shm）で **byte 一致**している固定契約。
+権威ドキュメントは [`docs/arps-shm-spec.md`](./docs/arps-shm-spec.md)。
+本リポは「**全 shm の作成・所有を一手に担う**」側で、受信側は attach
+専用（これらに加え yt-translator がライブ字幕入力として attach のみ行う）。
 
 - 名前: macOS POSIX shm 上限 **31 文字**内で `intent.<gen>.<fmt>.<slot>`
-  規約（詳細 `docs/multi-voice-slots-design.md`）。現フェーズで稼働中:
+  規約（台帳は `docs/arps-shm-spec.md` §5、スロット拡張計画は
+  `docs/multi-voice-slots-design.md`）。現フェーズで稼働中:
 
   | 名前 | 方向 / 用途 | レイアウト |
   |---|---|---|
@@ -58,6 +77,9 @@ C# 受信側は attach 専用。
   | `/4ksp.voice3.<2..4>`  | 同上、枠2..4（複数モデル独立リップシンク）             | ARPS v1 / mono48k |
   | `/babigoe.in3`         | audio-router → babigoe (マイク供給)                    | ARPS v1 / mono48k |
   | `/babigoe.out3`        | babigoe → audio-router (DSP 後を回収)                  | ARPS v1 / mono48k |
+  | `/babigoe-in.g1.m48.1` / `-out.g1.m48.1` | babigoe VST デッキ用の対 (新文法)   | ARPS v1 / mono48k |
+  | `/obs.mic3` / `.2..4`  | audio-router → OBS ほか（配信マイク音声。`.2` は既定でライブ字幕 yt-translator が attach） | ARPS v1 / mono48k |
+  | `/obs.video3` / `.2`   | audio-router → OBS（映像音）                           | ARPS v1 / mono48k |
 
 - ヘッダ **64 byte**（リトルエンディアン）:
 

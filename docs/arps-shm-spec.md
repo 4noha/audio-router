@@ -249,6 +249,11 @@ byte 契約が ARPS v1 + プロファイル `m48` のままで shm 名だけ増�
 | `/babigoe-out.g1.m48.2..3` | babigoe→router | audio-router | babigoe-kai  | audio-router | 予約 | 📦 |
 | `/babigoe.in3.<2..4>`   | (廃止予定)   | -            | -            | -           | §3.3 短期暫定運用。新規利用は §3.2 新文法へ。下記 deprecated | 🚮 |
 | `/babigoe.out3.<2..4>`  | (廃止予定)   | -            | -            | -           | 同上 | 🚮 |
+| `/obs.mic3`         | router→OBS | audio-router | audio-router | OBS (SHM Input source) | 配信マイク音声 (枠1) | ✅ |
+| `/obs.mic3.2`       | →yt-translator | audio-router **または** OBS filter (allow_create, §6 逸脱) | audio-router の OBS#2 sink 行 **または** OBS「AudioRouter SHM Output」フィルタ (**同時は 1 書き手のみ**) | yt-translator (`src/yt_translator/arps.py`) | ライブ字幕入力 (`serve_engine.py --arps` 既定枠)。供給は AudioRouter fan-out 行か、OBS 内ソースに付けた SHM Output フィルタのどちらか片方 | ✅ |
+| `/obs.mic3.<3..4>`  | router→consumer | audio-router | audio-router | OBS / 任意 attach 側 | マイク fan-out 予備枠 | ✅ |
+| `/obs.video3`       | router→OBS | audio-router | audio-router | OBS (SHM Input source) | 映像音 (枠1) | ✅ |
+| `/obs.video3.2`     | router→OBS | audio-router | audio-router | OBS (SHM Input source) | 映像音 (枠2) | ✅ |
 
 ### 5.2 ARPS v1 / 拡張プロファイル (`st48` / `m96` / `st96` ほか)
 
@@ -281,6 +286,7 @@ byte 契約が ARPS v1 + プロファイル `m48` のままで shm 名だけ増�
 | `babigoe-kai` (.NET) | attach 専用 / 双方向 (`/babigoe.in3` read + `/babigoe.out3` write) | `src/BabigoeMac/Audio/Arp1ShmReader.cs` / `Arp1ShmWriter.cs` |
 | `pan-pan` (.NET) | attach 専用 / 効果音抽出経路 | (audio-router 経由参照) |
 | `obs-plugins/obs-audio-router-shm` (C/Obj-C++) | attach 専用 / OBS filter 経路 | (audio-router 経由参照) |
+| `yt-translator` (Python) | attach 専用 / ライブ字幕入力 (m48 読取のみ、契約ミラー義務なし) | `src/yt_translator/arps.py` |
 
 共通制約:
 
@@ -289,6 +295,10 @@ byte 契約が ARPS v1 + プロファイル `m48` のままで shm 名だけ増�
 - attach 直後に `magic`/`version`/`channels`/`capacity` を §2 と照合。不一致なら attach 拒否。
 - 受信開始時に `consumerPid` フィールドへ自 PID を書込む (audio-router が `kill(pid,0)` で生存監視)。
 - プロセス終了時 `shm_unlink` を**呼んではならない** (audio-router が一手に管理)。
+- **1 shm = 1 consumer**。`readIndex` は単一の共有カーソルなので、同じ枠を
+  複数プロセスで読むとフレームを奪い合う。複数の読み手が欲しい場合は
+  audio-router 側で同じ bus を別 sink 行へ fan-out し、枠を分ける
+  (例: OBS = `/obs.mic3`、ライブ字幕 = `/obs.mic3.2`)。
 
 **既知の逸脱 (deviation)**
 
@@ -318,4 +328,14 @@ byte 契約が ARPS v1 + プロファイル `m48` のままで shm 名だけ増�
   §3.2 新文法 (`/babigoe-in.g1.m48.1` / `/babigoe-out.g1.m48.1`) へ移行。namespace に
   `-in` / `-out` 接尾辞を付けて方向を分離する慣習を §3.2 に追記。
   旧 §3.3 拡張は §5 で 🚮 廃止予定マークに降格。
+- 2026-07-13: §5.1 に `/obs.mic3*` / `/obs.video3*` を追記 (実装済みだった台帳漏れの
+  補完)。yt-translator を attach 専用 consumer として §6 に追加 —
+  `serve_engine.py --arps` がマイク fan-out 枠 (`/obs.mic3.2` 既定) を読んで
+  ライブ字幕を生成する。**1 shm = 1 consumer** の制約を §6 共通制約へ明文化。
+- 2026-07-13: `/obs.mic3.2` の書き手を二者択一に拡張 — AudioRouter の OBS#2
+  sink 行に加え、**OBS 内の任意ソースへ付けた「AudioRouter SHM Output」
+  フィルタ** (allow_create ON、§6 逸脱の明示 opt-in) でも供給可。字幕対象を
+  OBS 側で指定したい運用向け。**1 枠 1 書き手** — 両方同時に ON にしない
+  (リング二重書込で音が壊れる)。フィルタ書込 ↔ Python リーダのペアは
+  スタンドアロン harness で無損失検証済み。
 - (将来) ARPS v2 ヘッダ構造変更時に §5.3 を実装ステータスへ昇格・§2 にレイアウト追記。
