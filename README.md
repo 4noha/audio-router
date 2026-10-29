@@ -203,4 +203,4 @@ docs/
 - Process Tap API 利用は Apple 公開 API のみ。
 - ARPS v1 共有メモリ契約は audio-router / 4ksplitter / babigoe-kai の
   3 repo で byte 一致して維持。
-- 個人利用前提（再配布・公開は不可）。
+- MIT License（`LICENSE`）。libopus（BSD-3-Clause）は Homebrew のものに動的リンクする。
